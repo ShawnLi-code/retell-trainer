@@ -1,0 +1,17 @@
+# 依赖
+node_modules/
+
+# 本地运行数据（训练库、书籍/图片缓存、PDF 转换产物）
+data/
+
+# 密钥与本地环境（.env.example 保留）
+.env
+.env.*
+!.env.example
+
+# 系统/编辑器杂项
+*.log
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc
