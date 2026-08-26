@@ -666,6 +666,7 @@ function stripSuffix(t) {
 
 async function runLinkTask(task, url) {
   try {
+    task.status = 'running';
     // 1) 解析元数据
     if (/douyin|iesdouyin/i.test(url) || /(^|\/)(share\/)?video\/\d{15,}/i.test(url) || /v\.douyin\.com/i.test(url)) {
       task.step = 'fetch';
