@@ -899,14 +899,22 @@ async function pdfExtractLines(doc, pageCount) {
 function assembleBlocks(lines, opts = {}) {
   const { bodySize, leftEdge } = opts;
   const indentThresh = bodySize * 1.35;
-  const yThresh = bodySize * 1.8; // 行距兜底：无缩进排版时按行距断段
+  // 段内行距众数（同页相邻行 top 差，仅统计行级常规间隔）；段落间距明显加大 → 新段
+  const gapHist = new Map();
+  for (let i = 1; i < lines.length; i++) {
+    const a = lines[i - 1], b = lines[i];
+    if (a.page !== b.page) continue;
+    const gap = b.top - a.top;
+    if (gap <= 0 || gap > bodySize * 2.2) continue;
+    const k = Math.round(gap);
+    gapHist.set(k, (gapHist.get(k) || 0) + 1);
+  }
+  let gapMode = bodySize * 1.9, gb = -1;
+  for (const [k, v] of gapHist) if (v > gb) { gb = v; gapMode = k; }
+  const gapThresh = gapMode * 1.28;
   const blocks = [];
   let cur = null;
-  let useYForStart = false; // 缩进占比过低时启用行距判定
-  if (lines.length > 20) {
-    const indented = lines.filter((l) => l.x0 >= leftEdge + indentThresh).length;
-    if (indented < lines.length * 0.02) useYForStart = true;
-  }
+  let prev = null;
   const flush = () => { if (cur && cur.text.trim()) blocks.push(cur); cur = null; };
   const classify = (t, s) => {
     if (s >= bodySize * 1.42 && t.length <= 50) return 'h1';
@@ -915,30 +923,37 @@ function assembleBlocks(lines, opts = {}) {
     if (/^第[一二三四五六七八九十百千\d]+\s*[课章节讲]/.test(t) && t.length <= 60 && !/[，。；：!?！？]$/.test(t)) return 'h2';
     if (/^[一二三四五六七八九十百]+[、.．]\S+/.test(t) && t.length <= 34) return 'h2';
     if (/^[·•●○◆▪]/.test(t)) return 'bullet';
-    if (/^[（(]\d+[）)]/.test(t) || /^\d{1,2}[、](?!\d)/.test(t)) return 'num';
+    if (/^[①②③④⑤⑥⑦⑧⑨⑩]/.test(t) || /^[（(]\d+[）)]/.test(t) || /^\d{1,2}[、](?!\d)/.test(t)) return 'num';
     return 'para';
   };
   for (const ln of lines) {
     const kind = classify(ln.text, ln.size);
-    if (kind === 'h1' || kind === 'h2') { flush(); blocks.push({ kind, text: ln.text }); continue; }
+    if (kind === 'h1' || kind === 'h2') { flush(); blocks.push({ kind, text: ln.text }); prev = ln; continue; }
+    // 同一物理行被切开的右半残片（同页、y 差 <1.5pt、x0 右移）：直接拼回当前块，不视为新段
+    const residual = prev && prev.page === ln.page
+      && Math.abs(ln.top - prev.top) < 1.5
+      && ln.x0 >= leftEdge + indentThresh * 0.5;
+    if (residual && cur) { cur.text = joinWrapped(cur.text, ln.text); prev = ln; continue; }
     // bullet / num 的无缩进续行归并回原列表项（x0 回落且无新的列表符号）
     const listCont = cur
       && (cur.kind === 'bullet' || cur.kind === 'num')
       && kind === 'para'
       && ln.x0 < leftEdge + indentThresh;
+    // 行距突变（仅同页相邻行；跨页行距不可靠，不参与判定）
+    const gapNew = cur && prev && prev.page === ln.page
+      && ln.top - prev.top >= gapThresh;
     let newBlock = !cur;
     if (!listCont) {
       if (kind !== cur?.kind) newBlock = true;
-      else if (useYForStart) newBlock = ln.top - cur.lastTop > yThresh;
-      else newBlock = ln.x0 >= leftEdge + indentThresh;
+      else newBlock = ln.x0 >= leftEdge + indentThresh || gapNew;
     }
     if (newBlock) {
       flush();
-      cur = { kind, text: ln.text, lastTop: ln.top };
+      cur = { kind, text: ln.text };
     } else {
       cur.text = joinWrapped(cur.text, ln.text);
-      cur.lastTop = ln.top;
     }
+    prev = ln;
   }
   flush();
   return blocks;
@@ -1032,7 +1047,7 @@ function writeEpubZip(entries, outFile) {
 }
 
 async function convertPdfToEpub(def) {
-  const CONV_VERSION = 4; // 启发式规则调整时递增，失效旧缓存
+  const CONV_VERSION = 5; // 启发式规则调整时递增，失效旧缓存
   const outDir = path.join(__dirname, 'data', 'epubs');
   fs.mkdirSync(outDir, { recursive: true });
   const outFile = path.join(outDir, def.id + '.epub');
