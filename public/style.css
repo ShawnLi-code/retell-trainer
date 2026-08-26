@@ -1377,3 +1377,38 @@ main.interview-wrap { max-width: 980px; }
   .interview-record summary { display: block; }
   .interview-record summary em { display: block; margin-top: 4px; }
 }
+
+/* ---------- 链接导入素材（抖音/小红书 → 转写 → 素材库） ---------- */
+.link-import {
+  margin-top: 20px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 16px 18px;
+}
+.link-import h3 { margin: 0 0 6px; }
+.link-import p { margin: 0 0 10px; }
+.link-import-row { display: flex; gap: 10px; }
+.link-import-row input {
+  flex: 1;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--ink);
+  font: inherit;
+}
+.link-import-row input:focus { outline: 2px solid var(--brand); outline-offset: 1px; }
+.link-import-row .primary { flex: none; }
+#link-status { margin-top: 10px; min-height: 20px; }
+.link-result {
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  line-height: 1.7;
+  font-size: 14px;
+}
+.link-result-head b { margin-right: 4px; }
+.link-result-body { color: var(--ink-soft); margin: 6px 0 10px; white-space: pre-wrap; }
+.link-error { color: #d64545; }

@@ -2,12 +2,15 @@
 const express = require('express');
 const path = require('node:path');
 const fs = require('node:fs');
+const { execFile } = require('node:child_process');
+const { randomUUID } = require('node:crypto');
 const db = require('./db');
 const { chat, parseJson, isConfigured, healthCheck } = require('./llm');
 const prompts = require('./prompts');
 const { fetchAndImport, reprocessFeedCards, getFeedHealth, importTed, importRmrb, importDailyShort, importShort } = require('./fetch_cards');
 const shelf = require('./bookshelf');
 const interviewTrainer = require('./interview-trainer');
+const { URL } = require('node:url');
 
 // 口语词词库：收尾报告时扫描命中（识别口语词/语气词/口头禅并给替换建议）
 const WORD_BANK = (() => {
@@ -588,6 +591,195 @@ async function autoFetch() {
 }
 
 const PORT = Number(process.env.PORT) || 3025;
+
+// ---------- 链接 → 复述素材（抖音/小红书等） ----------
+// 服务器依赖：/opt/dy-api/.venv/bin/python + /root/dy_parse.py（解析）+ /root/asr.py（转写）
+const PY_BIN = process.env.DY_PY_BIN || (process.platform === 'win32'
+  ? path.join(__dirname, '..', 'tools', 'dy-api', '.venv', 'Scripts', 'python.exe')
+  : '/opt/dy-api/.venv/bin/python');
+const DY_PARSE_SCRIPT = process.env.DY_PARSE_SCRIPT || (process.platform === 'win32'
+  ? path.join(__dirname, '..', 'tools', 'dy-api', 'dy_parse.py')
+  : '/root/dy_parse.py');
+const ASR_SCRIPT = process.env.ASR_SCRIPT || (process.platform === 'win32'
+  ? path.join(__dirname, '..', 'tools', 'dy-api', 'asr.py')
+  : '/root/asr.py');
+const DY_CACHE_DIR = process.env.DY_CACHE_DIR || '/opt/dy-cache';
+const LINK_ALLOWED_HOSTS = ['v.douyin.com', 'www.douyin.com', 'douyin.com', 'iesdouyin.com', 'xhslink.com', 'www.xiaohongshu.com', 'xiaohongshu.com'];
+
+const linkTasks = new Map(); // id -> {status, meta, text, error, created, step}
+const linkQueue = [];
+let linkRunning = false;
+
+function pyRun(script, arg, timeoutMs = 150000) {
+  return new Promise((resolve) => {
+    execFile(PY_BIN, [script, arg], { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) {
+        const raw = String(stderr || stdout || err.message || '').trim().split('\n').filter(Boolean).pop() || String(err.message || '失败');
+        return resolve({ ok: false, error: String(raw).slice(0, 200) });
+      }
+      try {
+        const j = JSON.parse(String(stdout).trim().split('\n').pop() || '{}');
+        resolve(j);
+      } catch {
+        resolve({ ok: false, error: '解析脚本输出失败' });
+      }
+    });
+  });
+}
+
+async function fetchJsonText(url) {
+  const res = await fetch(url, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36' },
+    signal: AbortSignal.timeout(25000),
+  });
+  return { status: res.status, text: await res.text() };
+}
+
+// 小红书/通用：抓页面取 og:title / og:description
+async function parseWebPage(url) {
+  const { status, text } = await fetchJsonText(url);
+  if (status !== 200) return { ok: false, error: `网页返回 ${status}` };
+  const meta = (name) => {
+    const m = text.match(new RegExp(`<meta[^>]+(?:name|property)=["']${name}["'][^>]*content=["']([^"']+)["']`, 'i'))
+      || text.match(new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]*(?:name|property)=["']${name}["']`, 'i'));
+    return m ? decodeHtml(m[1]) : '';
+  };
+  const decodeHtml = (s) => s.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, ' ');
+  const title = meta('og:title') || meta('description') || '';
+  const desc = meta('og:description') || '';
+  if (!title && !desc) return { ok: false, error: '这个页面没能提取到文字（可能需要登录，或换一条链接）' };
+  return { ok: true, title: cleanTitle(title), desc: desc, platform: /xiaohongshu|xhslink/i.test(url) ? '小红书' : '网页' };
+}
+
+function cleanTitle(t) {
+  return String(t).replace(/\s+/g, ' ').trim().slice(0, 80).replace(/[\u200b\u200c]/g, '').trim();
+}
+
+function titleFromDesc(desc) {
+  const line = String(desc || '').split('\n')[0].replace(/#\S+/g, '').trim();
+  return stripSuffix(line || '抖音视频').slice(0, 60);
+}
+
+function stripSuffix(t) {
+  return t.replace(/[，。！？、：；\s]+$/g, '').trim();
+}
+
+async function runLinkTask(task, url) {
+  try {
+    // 1) 解析元数据
+    if (/douyin|iesdouyin/i.test(url) || /(^|\/)(share\/)?video\/\d{15,}/i.test(url) || /v\.douyin\.com/i.test(url)) {
+      task.step = 'fetch';
+      const meta = await pyRun(DY_PARSE_SCRIPT, url, 120000);
+      if (!meta.ok) return fail(task, meta.error || '抖音解析失败');
+      task.meta = meta;
+      // 有的视频无音乐/音频源则回退视频流
+      if (!meta.music_url && !meta.video_url) return fail(task, '没有找到音频/视频地址');
+      // 2) 下载音频
+      task.step = 'audio';
+      const audioUrl = meta.music_url || meta.video_url;
+      fs.mkdirSync(DY_CACHE_DIR, { recursive: true });
+      const audioPath = path.join(DY_CACHE_DIR, meta.id + '.mp3');
+      if (!fs.existsSync(audioPath)) {
+        const res = await fetch(audioUrl, { signal: AbortSignal.timeout(180000) });
+        if (!res.ok) return fail(task, '音频下载失败（HTTP ' + res.status + '）');
+        const buf = Buffer.from(await res.arrayBuffer());
+        fs.writeFileSync(audioPath, buf);
+      }
+      // 3) ASR 转写
+      task.step = 'transcribe';
+      const asr = await pyRun(ASR_SCRIPT, audioPath, 30 * 60 * 1000);
+      if (!asr.ok) return fail(task, asr.error || '语音转写失败');
+      task.text = cleanTranscript(asr.text);
+      task.status = 'done';
+    } else if (/xiaohongshu|xhslink/i.test(url)) {
+      task.step = 'fetch';
+      const page = await parseWebPage(url);
+      if (!page.ok) return fail(task, page.error);
+      task.meta = { desc: page.desc || '', title: page.title };
+      task.text = cleanTranscript(page.desc);
+      task.status = 'done';
+    } else {
+      // 其他：尝试通用网页元数据
+      task.step = 'fetch';
+      const page = await parseWebPage(url);
+      if (!page.ok) return fail(task, page.error);
+      task.meta = { desc: page.desc || '', title: page.title || '网页' };
+      task.text = cleanTranscript(page.desc);
+      task.status = 'done';
+    }
+  } catch (err) {
+    fail(task, String(err.message || err));
+  }
+}
+
+function cleanTranscript(t) {
+  return String(t || '').replace(/\s+/g, '').trim();
+}
+
+function fail(task, error) {
+  task.status = 'failed';
+  task.error = error;
+  saveTask(task);
+}
+
+function saveTask(task) {
+  try { fs.writeFileSync(path.join('/tmp', 'link-task-' + task.id + '.json'), JSON.stringify(task)); } catch { /* 忽略 */ }
+}
+
+function pumpLinkQueue() {
+  if (linkRunning) return;
+  const task = linkQueue.shift();
+  if (!task) { linkRunning = false; return; }
+  linkRunning = true;
+  runLinkTask(task, task.url).finally(() => {
+    saveTask(task);
+    linkRunning = false;
+    pumpLinkQueue();
+  });
+}
+
+app.post('/api/material/link', (req, res) => {
+  const raw = String((req.body || {}).url || '').trim();
+  let host;
+  try { host = new URL(raw).hostname.replace(/^www\./, ''); } catch { return res.status(400).json({ error: '链接格式不对，请粘贴完整链接' }); }
+  if (!LINK_ALLOWED_HOSTS.includes(host)) {
+    return res.status(400).json({ error: '目前支持抖音（douyin.com）和小红书（xiaohongshu.com）的分享链接' });
+  }
+  // 简单去重：同一 URL 进行中/完成的任务直接复用（读取最近 10 个）
+  for (const t of linkTasks.values()) {
+    if (t.url === raw && (t.status === 'done' || t.status === 'failed')) {
+      return res.json({ taskId: t.id, cached: true });
+    }
+  }
+  const task = { id: randomUUID().slice(0, 8), url: raw, status: 'queued', step: '', meta: null, text: '', error: '', created: Date.now() };
+  linkTasks.set(task.id, task);
+  linkQueue.push(task);
+  pumpLinkQueue();
+  res.json({ taskId: task.id });
+});
+
+app.get('/api/material/link/:id', (req, res) => {
+  const task = linkTasks.get(req.params.id);
+  if (!task) return res.status(404).json({ error: '任务不存在' });
+  res.json({
+    id: task.id, status: task.status, step: task.step,
+    meta: task.status === 'done' ? task.meta : null,
+    text: task.status === 'done' ? task.text : '',
+    error: task.error || '', cached: Boolean(task.cached),
+  });
+});
+
+// 转写结果存入素材库（复述素材）
+app.post('/api/material/link/:id/save', (req, res) => {
+  const task = linkTasks.get(req.params.id);
+  if (!task || task.status !== 'done') return res.status(400).json({ error: '任务还没有完成' });
+  const text = String(task.text || '').trim();
+  if (text.length < 30) return res.status(400).json({ error: '转写内容太短，不适合做素材' });
+  const meta = task.meta || {};
+  const title = cleanTitle(String((req.body || {}).title || '').trim() || titleFromDesc(meta.desc || meta.title || ''));
+  const id = db.createCard({ title, content: text, source: '抖音' + (meta.author ? '@' + meta.author : ''), category: 'story' });
+  res.json({ id, title });
+});
 app.listen(PORT, () => {
   console.log(`复述训练场已启动：http://localhost:${PORT}`);
   console.log(isConfigured() ? 'LLM 已配置 ✅' : 'LLM 未配置 ⚠️  练习页会提示检查 .env');

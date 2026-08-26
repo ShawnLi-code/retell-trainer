@@ -154,7 +154,16 @@ async function home(root) {
           <div><b>${esc(c.name)}</b><span class="dim">${esc(c.desc)}</span></div>
         </button>`).join('')}
     </div>
-    <div id="pick-status" class="dim"></div>`;
+    <div id="pick-status" class="dim"></div>
+    <div class="link-import">
+      <h3>🔗 粘贴链接，直接生成复述素材</h3>
+      <p class="dim">抖音 / 小红书的视频分享链接 → 自动解析并转写文字稿 → 一键存入素材库。视频约 1-2 分钟转写完成。</p>
+      <div class="link-import-row">
+        <input id="link-url" type="text" placeholder="粘贴 v.douyin.com/... 或 xhslink.com/... 分享链接" />
+        <button id="link-go" class="primary">解析</button>
+      </div>
+      <div id="link-status"></div>
+    </div>`;
 
   root.querySelectorAll('.pick-card').forEach((btn) => {
     btn.addEventListener('click', async () => {
@@ -174,9 +183,82 @@ async function home(root) {
       }
     });
   });
+  bindLinkImport(root);
 }
 
-// 素材弹窗：展示完整素材，读完点"开始复述"
+// ---------- 链接 → 复述素材（抖音/小红书） ----------
+function bindLinkImport(root) {
+  const urlInput = $('#link-url');
+  const goBtn = $('#link-go');
+  const statusEl = $('#link-status');
+  if (!urlInput || !goBtn) return;
+  let timer = null;
+  let savedOk = false;
+
+  const setStatus = (html) => { statusEl.innerHTML = html; };
+
+  const poll = async (taskId) => {
+    try {
+      const t = await api.get('/api/material/link/' + taskId);
+      if (t.status === 'queued') setStatus('<span class="dim">已加入队列…</span>');
+      else if (t.status === 'fetching' || t.status === 'audio' || t.status === 'transcribe') {
+        const msg = { fetching: '解析视频信息…', audio: '下载音频…', transcribe: '🎙️ 语音转写中（约 1-2 分钟）…' }[t.step] || '处理中…';
+        setStatus(`<span class="dim">${msg}</span>`);
+      } else if (t.status === 'done') {
+        if (savedOk) return;
+        const meta = t.meta || {};
+        const title = (meta.desc || meta.title || '视频') .split('\n')[0].trim().slice(0, 50);
+        const words = t.text.length;
+        setStatus(`
+          <div class="link-result">
+            <div class="link-result-head"><b>${esc(title)}</b>${meta.author ? `<span class="dim"> · ${esc(meta.author)}</span>` : ''}<span class="dim"> · ${words} 字</span></div>
+            <div class="link-result-body">${esc(t.text.slice(0, 260))}${t.text.length > 260 ? '…' : ''}</div>
+            <button id="link-save" class="primary">📥 存入素材库</button>
+          </div>`);
+        const saveBtn = $('#link-save');
+        if (saveBtn) saveBtn.addEventListener('click', async () => {
+          saveBtn.disabled = true;
+          saveBtn.textContent = '已存入 ✅';
+          try {
+            await api.post(`/api/material/link/${taskId}/save`, {});
+            savedOk = true;
+            toast('已存入素材库，去「素材」页或首页选「订阅素材复述」就能练');
+            setTimeout(() => { if (urlInput) urlInput.value = ''; }, 200);
+          } catch (err) { toast('存入失败：' + err.message); saveBtn.disabled = false; saveBtn.textContent = '📥 存入素材库'; }
+        });
+        return; // 停止轮询
+      } else if (t.status === 'failed') {
+        setStatus(`<div class="link-error">⚠️ ${esc(t.error || '解析失败')}</div>`);
+        goBtn.disabled = false;
+        goBtn.textContent = '解析';
+        return;
+      }
+      timer = setTimeout(() => poll(taskId), 2500);
+    } catch (err) {
+      setStatus(`<div class="link-error">⚠️ ${esc(err.message)}</div>`);
+      goBtn.disabled = false;
+      goBtn.textContent = '解析';
+    }
+  };
+
+  goBtn.addEventListener('click', async () => {
+    const url = urlInput.value.trim();
+    if (!url) { toast('先粘贴链接'); return; }
+    goBtn.disabled = true;
+    goBtn.textContent = '提交中…';
+    try {
+      const r = await api.post('/api/material/link', { url });
+      if (r.cached) setStatus('<span class="dim">上次解析过这条链接，正在读取结果…</span>');
+      else setStatus('<span class="dim">已提交，开始解析…</span>');
+      poll(r.taskId);
+    } catch (err) {
+      setStatus(`<div class="link-error">⚠️ ${esc(err.message)}</div>`);
+      goBtn.disabled = false;
+      goBtn.textContent = '解析';
+    }
+  });
+  urlInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') goBtn.click(); });
+}
 function showMaterialModal(card, onStart) {
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
