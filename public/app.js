@@ -1357,6 +1357,23 @@ async function bookshelf(root) {
     </div>`;
   bindEpubUpload(root);
   if (!BOOKS.length) return;
+  // 删除按钮（委托，兼容 carousel 双份卡片）：确认后删除书文件+缓存+划线
+  root.addEventListener('click', async (e) => {
+    const delBtn = e.target.closest('.book-del');
+    if (!delBtn) return;
+    e.stopPropagation();
+    const id = delBtn.dataset.del;
+    const book = BOOKS.find((b) => b.id === id);
+    if (!book) return;
+    if (!confirm(`删除《${book.title}》？\n\n书文件将从书库移除，划线/书签一并清除，无法恢复。`)) return;
+    try {
+      await api.del(`/api/bookshelf/${id}`);
+      toast(`已删除《${book.title}》`);
+      await bookshelf(root);
+    } catch (err) {
+      toast('删除失败：' + err.message);
+    }
+  });
   if (!useCarousel) {
     root.querySelectorAll('.book-card').forEach((card) => card.addEventListener('click', () => openBook(card.dataset.id)));
     return;
@@ -1448,6 +1465,7 @@ function bookCard(b) {
   const hue = [...b.title].reduce((s, c) => s + c.codePointAt(0), 0) % 360;
   return `
     <div class="book-card" data-id="${b.id}" title="${esc(b.title)}">
+      <button class="book-del" data-del="${b.id}" title="从书架删除" aria-label="删除">✕</button>
       <div class="book-cover-stack">
         <div class="book-cover text-cover" style="background:linear-gradient(160deg,hsl(${hue},45%,42%),hsl(${(hue + 40) % 360},55%,28%))">
           <span class="tc-title">${esc(b.title.slice(0, 10))}</span>

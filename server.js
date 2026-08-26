@@ -375,6 +375,19 @@ app.get('/api/bookshelf/:id/cover', (req, res) => {
   } catch { res.status(404).end(); }
 });
 
+// 从书架删除图书（书文件 + 转换缓存 + 划线/书签）
+app.delete('/api/bookshelf/:id', (req, res) => {
+  if (!/^[a-f0-9]{12}$/.test(req.params.id)) return res.status(400).json({ error: '无效的书 ID' });
+  try {
+    const r = shelf.removeBook(req.params.id);
+    if (!r.ok) return res.status(404).json(r);
+    try { db.deleteBookMarksByBook(req.params.id); } catch { /* 书签清理失败不影响删除 */ }
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // PDF 原页渲染图（mupdf，懒生成 + 缓存）
 app.get('/api/bookshelf/:id/pages/:n', async (req, res) => {
   if (!/^[a-f0-9]{12}$/.test(req.params.id)) return res.status(400).end();

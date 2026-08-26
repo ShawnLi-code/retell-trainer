@@ -593,6 +593,7 @@ textarea:focus, input:focus { outline: none; border-color: var(--brand); backgro
 
 /* 只作用于读书书架的封面卡（书库 views 也用 .book-card，不能全局限宽） */
 .shelf-track .book-card {
+  position: relative;
   width: 132px;
   cursor: pointer;
   flex: none;
@@ -600,6 +601,31 @@ textarea:focus, input:focus { outline: none; border-color: var(--brand); backgro
   transition: transform .15s ease;
 }
 .shelf-track .book-card:hover { transform: translateY(-4px) scale(1.03); }
+/* 删除按钮：悬停浮现，触屏常显 */
+.shelf-track .book-del {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 6;
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, .55);
+  color: #fff;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .15s ease, background .15s ease;
+}
+.shelf-track .book-card:hover .book-del,
+.shelf-track .book-del:focus-visible { opacity: 1; }
+.shelf-track .book-del:hover,
+.shelf-track .book-del:focus-visible { background: #d64545; }
+@media (hover: none) {
+  .shelf-track .book-del { opacity: .85; }
+}
 .book-cover {
   width: 132px;
   height: 182px;

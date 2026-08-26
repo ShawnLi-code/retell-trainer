@@ -682,6 +682,30 @@ async function getBook(id) {
   return { ...book, id, format: def.format || path.extname(def.file).slice(1).toLowerCase() };
 }
 
+// 从书架删除：删书文件（顶层文件直接删；单书目录整目录删；多书目录只删本文件）+ 转换缓存
+function removeBook(id) {
+  const def = findDef(id);
+  if (!def || !def.file) return { ok: false, error: '没找到这本书' };
+  const parent = path.dirname(def.file);
+  if (parent === ROOT) {
+    try { fs.unlinkSync(def.file); } catch (err) { if (err.code !== 'ENOENT') return { ok: false, error: '删除文件失败：' + err.message }; }
+  } else {
+    const bookFiles = fs.readdirSync(parent).filter((f) => BOOK_EXTS.includes(path.extname(f).toLowerCase()));
+    if (bookFiles.length <= 1) {
+      fs.rmSync(parent, { recursive: true, force: true });
+    } else {
+      try { fs.unlinkSync(def.file); } catch (err) { if (err.code !== 'ENOENT') return { ok: false, error: '删除文件失败：' + err.message }; }
+    }
+  }
+  const cacheDir = path.join(__dirname, 'data', 'epubs');
+  if (fs.existsSync(cacheDir)) {
+    for (const f of fs.readdirSync(cacheDir)) {
+      if (f.startsWith(id + '.')) { try { fs.unlinkSync(path.join(cacheDir, f)); } catch { /* 缓存删除失败无碍 */ } }
+    }
+  }
+  return { ok: true };
+}
+
 function getCover(id) {
   const def = findDef(id);
   const file = epubFileOf(def); // 转换过的 PDF 也能取封面（若转换产物带封面则生效）
@@ -1334,4 +1358,4 @@ function getRes(id, p) {
   } catch { return null; }
 }
 
-module.exports = { scanBooks, importEpub, importPdf, getBook, getCover, pagePng, pageStructuredText, getBookImg, getChapterRaw, getRawAll, getSpineContent, getRes, ROOT };
+module.exports = { scanBooks, importEpub, importPdf, removeBook, getBook, getCover, pagePng, pageStructuredText, getBookImg, getChapterRaw, getRawAll, getSpineContent, getRes, ROOT };

@@ -224,6 +224,7 @@ function listSpeechLogs() {
 // ---------- 读书标记 ----------
 const addMarkStmt = db.prepare(`INSERT INTO book_marks (book_id, chapter, text, kind, note) VALUES (?, ?, ?, ?, ?)`);
 const delMarkStmt = db.prepare(`DELETE FROM book_marks WHERE id = ? AND book_id = ?`);
+const delAllMarksStmt = db.prepare(`DELETE FROM book_marks WHERE book_id = ?`);
 const listMarksStmt = db.prepare(`SELECT * FROM book_marks WHERE book_id = ? ORDER BY id ASC`);
 
 function addBookMark({ bookId, chapter = 0, text, kind = 'mark', note = '' }) {
@@ -233,6 +234,10 @@ function addBookMark({ bookId, chapter = 0, text, kind = 'mark', note = '' }) {
 
 function deleteBookMark(id, bookId) {
   return delMarkStmt.run(id, bookId).changes > 0;
+}
+
+function deleteBookMarksByBook(bookId) {
+  return delAllMarksStmt.run(bookId).changes > 0;
 }
 
 function listBookMarks(bookId) {
@@ -268,6 +273,7 @@ module.exports = {
   listSpeechLogs,
   addBookMark,
   deleteBookMark,
+  deleteBookMarksByBook,
   listBookMarks,
   totalSessions,
 };
