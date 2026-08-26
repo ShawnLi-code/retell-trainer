@@ -18,3 +18,5 @@ __pycache__/
 
 # 部署专用密钥（GitHub Actions 用，绝不入库）
 .deploy/
+# webhook secret scratch (never commit)
+.webhook-secret.txt

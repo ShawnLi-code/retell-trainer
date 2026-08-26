@@ -899,8 +899,14 @@ async function pdfExtractLines(doc, pageCount) {
 function assembleBlocks(lines, opts = {}) {
   const { bodySize, leftEdge } = opts;
   const indentThresh = bodySize * 1.35;
+  const yThresh = bodySize * 1.8; // 行距兜底：无缩进排版时按行距断段
   const blocks = [];
   let cur = null;
+  let useYForStart = false; // 缩进占比过低时启用行距判定
+  if (lines.length > 20) {
+    const indented = lines.filter((l) => l.x0 >= leftEdge + indentThresh).length;
+    if (indented < lines.length * 0.02) useYForStart = true;
+  }
   const flush = () => { if (cur && cur.text.trim()) blocks.push(cur); cur = null; };
   const classify = (t, s) => {
     if (s >= bodySize * 1.42 && t.length <= 50) return 'h1';
@@ -915,11 +921,23 @@ function assembleBlocks(lines, opts = {}) {
   for (const ln of lines) {
     const kind = classify(ln.text, ln.size);
     if (kind === 'h1' || kind === 'h2') { flush(); blocks.push({ kind, text: ln.text }); continue; }
-    if (!cur || kind !== cur.kind || ln.x0 >= leftEdge + indentThresh) {
+    // bullet / num 的无缩进续行归并回原列表项（x0 回落且无新的列表符号）
+    const listCont = cur
+      && (cur.kind === 'bullet' || cur.kind === 'num')
+      && kind === 'para'
+      && ln.x0 < leftEdge + indentThresh;
+    let newBlock = !cur;
+    if (!listCont) {
+      if (kind !== cur?.kind) newBlock = true;
+      else if (useYForStart) newBlock = ln.top - cur.lastTop > yThresh;
+      else newBlock = ln.x0 >= leftEdge + indentThresh;
+    }
+    if (newBlock) {
       flush();
-      cur = { kind, text: ln.text };
+      cur = { kind, text: ln.text, lastTop: ln.top };
     } else {
       cur.text = joinWrapped(cur.text, ln.text);
+      cur.lastTop = ln.top;
     }
   }
   flush();
@@ -1014,7 +1032,7 @@ function writeEpubZip(entries, outFile) {
 }
 
 async function convertPdfToEpub(def) {
-  const CONV_VERSION = 3; // 启发式规则调整时递增，失效旧缓存
+  const CONV_VERSION = 4; // 启发式规则调整时递增，失效旧缓存
   const outDir = path.join(__dirname, 'data', 'epubs');
   fs.mkdirSync(outDir, { recursive: true });
   const outFile = path.join(outDir, def.id + '.epub');
@@ -1045,8 +1063,13 @@ async function convertPdfToEpub(def) {
     const k = Math.round(l.x0 / 2) * 2;
     xHist.set(k, (xHist.get(k) || 0) + 1);
   }
-  let leftEdge = 80, bx = -1;
-  for (const [k, v] of xHist) if (v > bx) { bx = v; leftEdge = k; }
+  // 正文左边距 = 首个占用 ≥4% 的最小 x0 簇（避免"段首缩进型排版"把众数带偏到缩进值）
+  const xEntries = [...xHist.entries()].sort((a, b) => a[0] - b[0]);
+  const xTotal = bodyLines.length || 1;
+  let leftEdge = xEntries.length ? xEntries[0][0] : 80;
+  for (const [k, v] of xEntries) {
+    if (v >= xTotal * 0.04) { leftEdge = k; break; }
+  }
 
   // 页眉/页脚/水印过滤：跨多数页面重复出现的短行；极端边距的纯数字行
   const pageCountByKey = new Map();
@@ -1061,6 +1084,7 @@ async function convertPdfToEpub(def) {
     if (pages.size >= Math.max(6, pageCount * 0.25)) repeated.add(k);
   }
   const lines = allLines.filter((l) => {
+    if (l.size < bodySize * 0.85) return false; // 页眉/水印等小字行直接剔除
     if (repeated.has(l.text.replace(/\s+/g, ''))) return false;
     if (/^\d{1,4}$/.test(l.text) && (l.top < l.ph * 0.07 || l.top > l.ph * 0.93)) return false;
     return true;
