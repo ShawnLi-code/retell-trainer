@@ -1,0 +1,21 @@
+name: Auto Deploy
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: SSH 部署到 VPS
+    runs-on: ubuntu-latest
+    steps:
+      - name: 通过 SSH 执行部署脚本
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: 129.204.188.81
+          username: root
+          port: 22
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          timeout: 120s
+          script: bash /home/Shawn/project/retell-trainer/deploy.sh

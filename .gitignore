@@ -15,3 +15,6 @@ data/
 Thumbs.db
 __pycache__/
 *.pyc
+
+# 部署专用密钥（GitHub Actions 用，绝不入库）
+.deploy/
