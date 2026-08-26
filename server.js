@@ -68,7 +68,8 @@ ${skills}`;
 }
 
 const app = express();
-app.use(express.json());
+// verify 里留存原始 body：github webhook 的 HMAC 必须对原始字节计算
+app.use(express.json({ limit: '2mb', verify: (req, _res, buf) => { req.rawBody = buf; } }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // 追问轮数上限（用户发言次数达到该值后强制收尾）
@@ -578,6 +579,27 @@ app.listen(PORT, () => {
   console.log(isConfigured() ? 'LLM 已配置 ✅' : 'LLM 未配置 ⚠️  练习页会提示检查 .env');
   if (isConfigured()) healthCheck().catch(() => { /* 自检不影响服务 */ });
 });
+
+// ---------- GitHub 推送自动部署（配置 WEBHOOK_SECRET 后启用） ----------
+if (process.env.WEBHOOK_SECRET) {
+  const crypto = require('node:crypto');
+  const { exec } = require('node:child_process');
+  const DEPLOY_SCRIPT = process.env.DEPLOY_SCRIPT || '/home/Shawn/project/retell-trainer/deploy.sh';
+  app.post('/github-webhook', (req, res) => {
+    const sig = req.headers['x-hub-signature-256'] || '';
+    const body = req.rawBody || Buffer.from(JSON.stringify(req.body || {}));
+    const expect = 'sha256=' + crypto.createHmac('sha256', process.env.WEBHOOK_SECRET).update(body).digest('hex');
+    if (!sig || sig.length !== expect.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expect))) {
+      return res.status(401).json({ ok: false, error: 'bad signature' });
+    }
+    const ev = req.headers['x-github-event'] || '';
+    if (ev !== 'push') return res.json({ ok: true, ignored: ev });
+    // 后台 detached 执行：本进程随部署重启也不影响部署继续
+    exec(`bash ${DEPLOY_SCRIPT} >> /var/log/retell-deploy.log 2>&1 &`, { detached: true, shell: '/bin/bash' }).unref();
+    res.json({ ok: true, deploying: true });
+  });
+  console.log('GitHub Webhook 自动部署已启用 ✅ (POST /github-webhook)');
+}
 // 启动 5 分钟后再跑第一次自动抓料（给服务喘口气），之后每天一次
 setTimeout(autoFetch, 5 * 60 * 1000);
 setInterval(autoFetch, 24 * 60 * 60 * 1000);
