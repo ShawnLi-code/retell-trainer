@@ -1333,15 +1333,15 @@ async function bookshelf(root) {
       <div class="shelf-head">
         <h2>我的书架 <span class="count">${BOOKS.length} 本</span></h2>
         <div class="shelf-import-actions">
-          <button class="primary" id="upload-epub">选择 EPUB</button>
+          <button class="primary" id="upload-epub">上传 EPUB / PDF</button>
           <button id="upload-epub-folder">选择文件夹</button>
-          <input id="epub-files" type="file" accept=".epub,application/epub+zip" multiple hidden>
-          <input id="epub-folder" type="file" accept=".epub,application/epub+zip" webkitdirectory directory multiple hidden>
+          <input id="epub-files" type="file" accept=".epub,.pdf,application/epub+zip,application/pdf" multiple hidden>
+          <input id="epub-folder" type="file" accept=".epub,.pdf,application/epub+zip,application/pdf" webkitdirectory directory multiple hidden>
         </div>
       </div>
       <div class="shelf-upload-note">
         <b>直接导入电子书</b>
-        <span class="dim">支持单本、多选或整个文件夹批量导入；只读取其中的 EPUB 文件，文件保存在本机。</span>
+        <span class="dim">支持单本、多选或整个文件夹批量导入 EPUB / PDF；PDF 导入后自动转为 EPUB 文字版浏览，文件保存在服务器书库。</span>
         <span class="shelf-upload-status dim" id="shelf-upload-status"></span>
       </div>
       ${BOOKS.length ? `<div class="shelf ${useCarousel ? '' : 'shelf-static'}">
@@ -1408,19 +1408,20 @@ function bindEpubUpload(root) {
   root.querySelector('#upload-epub-folder').addEventListener('click', () => folderInput.click());
 
   const upload = async (fileList) => {
-    const epubs = [...fileList].filter((file) => file.name.toLowerCase().endsWith('.epub'));
-    if (!epubs.length) { toast('没有找到 EPUB 文件'); return; }
+    const books = [...fileList].filter((file) => /\.(epub|pdf)$/i.test(file.name));
+    if (!books.length) { toast('没有找到 EPUB / PDF 文件'); return; }
     let added = 0;
     let skipped = 0;
     const failed = [];
-    for (let i = 0; i < epubs.length; i += 1) {
-      const file = epubs[i];
-      status.textContent = `正在导入 ${i + 1}/${epubs.length}：${file.name}`;
+    for (let i = 0; i < books.length; i += 1) {
+      const file = books[i];
+      const isPdf = /\.pdf$/i.test(file.name);
+      status.textContent = `正在导入 ${i + 1}/${books.length}${isPdf ? '（PDF 将自动转为 EPUB）' : ''}：${file.name}`;
       try {
         const response = await fetch('/api/bookshelf/upload', {
           method: 'POST',
           headers: {
-            'Content-Type': 'application/epub+zip',
+            'Content-Type': isPdf ? 'application/pdf' : 'application/epub+zip',
             'X-File-Name': encodeURIComponent(file.webkitRelativePath || file.name),
           },
           body: file,
@@ -1436,7 +1437,7 @@ function bindEpubUpload(root) {
     const summary = `导入完成：新增 ${added} 本${skipped ? `，跳过重复 ${skipped} 本` : ''}${failed.length ? `，失败 ${failed.length} 本` : ''}`;
     await bookshelf(root);
     toast(summary);
-    if (failed.length) console.warn('EPUB 导入失败', failed);
+    if (failed.length) console.warn('图书导入失败', failed);
   };
 
   fileInput.addEventListener('change', () => upload(fileInput.files));

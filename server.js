@@ -350,14 +350,15 @@ app.get('/api/bookshelf', (req, res) => {
 });
 
 app.post('/api/bookshelf/upload', express.raw({
-  type: ['application/epub+zip', 'application/octet-stream'],
+  type: ['application/epub+zip', 'application/octet-stream', 'application/pdf'],
   limit: '200mb',
 }), (req, res) => {
   let filename = req.get('x-file-name') || '';
   try { filename = decodeURIComponent(filename); } catch { /* 使用原始文件名继续校验 */ }
   if (!filename) return res.status(400).json({ error: '缺少文件名' });
   try {
-    const result = shelf.importEpub(req.body, filename);
+    const isPdf = filename.toLowerCase().endsWith('.pdf');
+    const result = isPdf ? shelf.importPdf(req.body, filename) : shelf.importEpub(req.body, filename);
     res.status(result.added ? 201 : 200).json(result);
   } catch (err) {
     res.status(400).json({ error: err.message });

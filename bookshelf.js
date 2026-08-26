@@ -109,6 +109,43 @@ function importEpub(buffer, originalName) {
   return { added: true, book };
 }
 
+// PDF 上传：存到书库后立即后台转 EPUB（缓存）；转换失败不致命，打开时会重试/退化
+function importPdf(buffer, originalName) {
+  if (!Buffer.isBuffer(buffer) || !buffer.length) throw new Error('上传文件为空');
+
+  const rawName = path.basename(String(originalName || 'book.pdf').replace(/\\/g, '/'));
+  if (path.extname(rawName).toLowerCase() !== '.pdf') throw new Error('只支持上传 PDF 文件');
+  if (buffer.subarray(0, 5).toString('latin1') !== '%PDF-') throw new Error('不是有效的 PDF 文件');
+
+  const safeBase = path.basename(rawName, path.extname(rawName))
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, '_')
+    .replace(/[. ]+$/g, '')
+    .trim() || '未命名图书';
+  let filename = `${safeBase}.pdf`;
+  let target = path.join(ROOT, filename);
+  let copy = 2;
+
+  while (fs.existsSync(target)) {
+    const current = fs.readFileSync(target);
+    if (current.length === buffer.length && current.equals(buffer)) {
+      const book = scanBooks().find((item) => item.id === idOf(filename));
+      return { added: false, book };
+    }
+    filename = `${safeBase} (${copy++}).pdf`;
+    target = path.join(ROOT, filename);
+  }
+
+  fs.writeFileSync(target, buffer, { flag: 'wx' });
+  const book = scanBooks().find((item) => item.id === idOf(filename));
+  // 后台预转换：不阻塞上传响应；打开书时若未完成会自动兜底转换
+  convertPdfToEpub(book).then(() => {
+    console.log(`[PDF→EPUB 预转换完成] ${book.title} → data/epubs/${book.id}.epub`);
+  }).catch((err) => {
+    console.error('[PDF→EPUB 预转换失败（打开时会重试）]', book.title, err.message);
+  });
+  return { added: true, book };
+}
+
 function countFiles(dir) {
   try { return fs.readdirSync(dir).filter((f) => /\.(txt|md)$/i.test(f)).length; } catch { return 0; }
 }
@@ -1258,4 +1295,4 @@ function getRes(id, p) {
   } catch { return null; }
 }
 
-module.exports = { scanBooks, importEpub, getBook, getCover, pagePng, pageStructuredText, getBookImg, getChapterRaw, getRawAll, getSpineContent, getRes, ROOT };
+module.exports = { scanBooks, importEpub, importPdf, getBook, getCover, pagePng, pageStructuredText, getBookImg, getChapterRaw, getRawAll, getSpineContent, getRes, ROOT };
