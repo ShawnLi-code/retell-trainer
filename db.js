@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS cards (
   content TEXT NOT NULL,
   source TEXT DEFAULT '',
   category TEXT DEFAULT 'story',
+  published_at TEXT,
   created_at TEXT DEFAULT (datetime('now','localtime')),
   used_at TEXT
 );
@@ -59,6 +60,7 @@ CREATE TABLE IF NOT EXISTS book_marks (
 
 // 兼容旧库：补 category 列
 try { db.exec(`ALTER TABLE cards ADD COLUMN category TEXT DEFAULT 'story'`); } catch { /* 已存在 */ }
+try { db.exec(`ALTER TABLE cards ADD COLUMN published_at TEXT`); } catch { /* 已存在 */ }
 
 // ---------- 本地日期工具 ----------
 // 注意：SQLite 的 date() 按 UTC 解析字符串，跨时区会算错日期，
@@ -71,14 +73,16 @@ function localDayKey(date = new Date()) {
 }
 
 // ---------- cards ----------
-const addCard = db.prepare(`INSERT INTO cards (title, content, source, category) VALUES (?, ?, ?, ?)`);
-const listCardsStmt = db.prepare(`SELECT id, title, content, source, category, created_at, used_at FROM cards ORDER BY id DESC`);
-const listCardsByCatStmt = db.prepare(`SELECT id, title, content, source, category, created_at, used_at FROM cards WHERE category = ? ORDER BY id DESC`);
+const addCard = db.prepare(`INSERT INTO cards (title, content, source, category, published_at) VALUES (?, ?, ?, ?, ?)`);
+const listCardsStmt = db.prepare(`SELECT id, title, content, source, category, published_at, created_at, used_at FROM cards ORDER BY id DESC`);
+const listCardsByCatStmt = db.prepare(`SELECT id, title, content, source, category, published_at, created_at, used_at FROM cards WHERE category = ? ORDER BY id DESC`);
 const getCardStmt = db.prepare(`SELECT * FROM cards WHERE id = ?`);
 const touchCard = db.prepare(`UPDATE cards SET used_at = datetime('now','localtime') WHERE id = ?`);
+const updateCardStmt = db.prepare(`UPDATE cards SET title = ?, content = ? WHERE id = ?`);
+const updateCardDateStmt = db.prepare(`UPDATE cards SET published_at = ? WHERE id = ?`);
 
-function createCard({ title, content, source = '', category = 'story' }) {
-  const r = addCard.run(title, content, source, category);
+function createCard({ title, content, source = '', category = 'story', publishedAt = localDayKey() }) {
+  const r = addCard.run(title, content, source, category, publishedAt || null);
   return Number(r.lastInsertRowid);
 }
 
@@ -92,6 +96,14 @@ function listCardsByCategory(category) {
 
 function getCard(id) {
   return getCardStmt.get(id);
+}
+
+function updateCard(id, { title, content }) {
+  return updateCardStmt.run(title, content, id).changes > 0;
+}
+
+function updateCardPublishedAt(id, publishedAt) {
+  return updateCardDateStmt.run(publishedAt || null, id).changes > 0;
 }
 
 const deleteCardStmt = db.prepare(`DELETE FROM cards WHERE id = ?`);
@@ -239,6 +251,8 @@ module.exports = {
   listCards,
   listCardsByCategory,
   getCard,
+  updateCard,
+  updateCardPublishedAt,
   deleteCard,
   deleteCardByTitle,
   newSession,

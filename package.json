@@ -5,7 +5,8 @@
   "description": "每日复述训练场 —— 纯自用本地表达训练",
   "main": "server.js",
   "scripts": {
-    "start": "node --env-file-if-exists=.env server.js"
+    "start": "node --env-file-if-exists=.env server.js",
+    "test": "node --test"
   },
   "dependencies": {
     "@xmldom/xmldom": "^0.9.12",

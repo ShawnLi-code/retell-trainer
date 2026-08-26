@@ -1,4 +1,4 @@
-// 复述训练场 · 前端逻辑（hash 路由 + 5 视图 + Web Speech 录音转写）
+// 复述训练场 · 前端逻辑（hash 路由 + 多视图 + Web Speech 录音转写）
 'use strict';
 
 // ---------- 小工具 ----------
@@ -12,6 +12,17 @@ const paras = (s) => String(s ?? '')
   .map((p) => p.replace(/\s*\n\s*/g, ' ').trim())
   .filter(Boolean);
 const renderContent = (text) => paras(text).map((p) => `<p>${esc(p)}</p>`).join('');
+const sourceHtml = (source) => {
+  const value = String(source || '');
+  const match = value.match(/^(.*?) · (https?:\/\/\S+)$/);
+  return match
+    ? `${esc(match[1])} · <a href="${esc(match[2])}" target="_blank" rel="noreferrer">查看原文</a>`
+    : esc(value);
+};
+const materialDate = (value) => {
+  const match = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+  return match ? `${match[1]}年${Number(match[2])}月${Number(match[3])}日` : '日期未知';
+};
 
 // 内联 SVG 图标（lucide 风格描边），避免 emoji 当图标
 const ICONS = {
@@ -63,16 +74,21 @@ const session = { id: null, card: null, turns: [], busy: false };
 const RETELL_SECONDS = 90;
 
 // ---------- 路由 ----------
-const NAV_GROUP = { home: 'practice', practice: 'practice', speech: 'speech', cards: 'material', bookshelf: 'reading', books: 'library', words: 'words', history: 'history' };
+const NAV_GROUP = { home: 'practice', practice: 'practice', speech: 'speech', cards: 'material', bookshelf: 'reading', interview: 'interview', books: 'library', words: 'words', history: 'history' };
 function router() {
   const parts = (location.hash.replace(/^#\/?/, '') || 'home').split('/');
   const hash = parts[0];
   const group = NAV_GROUP[hash] || 'practice';
+  if (hash !== 'interview' && typeof INTERVIEW_STATE !== 'undefined') {
+    clearInterval(INTERVIEW_STATE.timer);
+    INTERVIEW_STATE.timer = null;
+  }
   document.querySelectorAll('#nav a').forEach((a) => a.classList.toggle('active', a.dataset.group === group));
   const app = $('#app');
   app.innerHTML = '';
+  app.className = '';
   if (hash === 'cards') { cards(app, parts[1] || 'ted'); return; }
-  const views = { home, practice, speech, bookshelf, books, history, words };
+  const views = { home, practice, speech, bookshelf, interview, books, history, words };
   (views[hash] || home)(app);
 }
 window.addEventListener('hashchange', router);
@@ -108,6 +124,7 @@ const CATS = {
   ted: { name: 'TED 演讲复述', desc: '观点/方法类演讲，完整中文文稿', icon: ICONS.sparkles },
   rmrb: { name: '人民日报素材复述', desc: '评论版：人民时评 · 今日谈 · 人民论坛', icon: ICONS.pin },
   short: { name: '每日短评复述', desc: '人民网观点短评 · 约500字 · 每日更新', icon: ICONS.refresh },
+  story: { name: '订阅素材复述', desc: '少数派 · 美团技术 · MIT · NASA 等自动抓取', icon: ICONS.refresh },
 };
 
 async function home(root) {
@@ -167,7 +184,7 @@ function showMaterialModal(card, onStart) {
     <div class="modal">
       <div class="modal-head">
         <b>${esc(card.title)}</b>
-        <span class="dim">完整素材 · ${card.content.length} 字 · 阅读不限时</span>
+        <span class="dim">${materialDate(card.published_at)} · 完整素材 · ${card.content.length} 字 · 阅读不限时</span>
         <button class="modal-close" aria-label="关闭">×</button>
       </div>
       <div class="modal-body card-content">${renderContent(card.content)}</div>
@@ -188,7 +205,7 @@ function showMaterialModal(card, onStart) {
       const cat = document.querySelector('.pick-card.active')?.dataset.cat || 'ted';
       const r = await api.post('/api/practice/pick', { category: cat });
       overlay.querySelector('.modal-head b').textContent = r.card.title;
-      overlay.querySelector('.modal-head span.dim').textContent = `完整素材 · ${r.card.content.length} 字 · 阅读不限时`;
+      overlay.querySelector('.modal-head span.dim').textContent = `${materialDate(r.card.published_at)} · 完整素材 · ${r.card.content.length} 字 · 阅读不限时`;
       overlay.querySelector('.modal-body').innerHTML = renderContent(r.card.content);
       overlay.querySelector('[data-start]').onclick = () => { close(); startPractice(r.card); };
     } catch (err) { toast(err.message); } finally {
@@ -207,6 +224,7 @@ function practice(root) {
   root.innerHTML = `
     <div class="card">
       <h2>${esc(card.title)}</h2>
+      <div class="dim material-date">文章日期：${materialDate(card.published_at)}</div>
       <div class="card-content">${renderContent(card.content)}</div>
     </div>
     <div id="chat" class="chat"></div>
@@ -484,7 +502,7 @@ const lenBadge = (n) =>
   : n <= 950 ? '<span class="badge badge-warn">接近标准</span>'
   : '<span class="badge badge-long">偏长</span>';
 
-// ---------- 素材库（TED / 人民日报 / 每日短评 三个板块） ----------
+// ---------- 素材库（TED / 人民日报 / 每日短评 / 订阅素材） ----------
 async function cards(root, sub = 'ted') {
   root.innerHTML = '<div class="loading">加载中…</div>';
   let list;
@@ -494,14 +512,14 @@ async function cards(root, sub = 'ted') {
     root.innerHTML = `<div class="empty">${esc(err.message)}</div>`;
     return;
   }
-  const cat = ['short', 'rmrb'].includes(sub) ? sub : 'ted';
+  const cat = ['ted', 'rmrb', 'short', 'story'].includes(sub) ? sub : 'ted';
   const items = list.filter((c) => c.category === cat);
   const catMeta = CATS[cat];
   const tabs = [
     ['ted', 'TED 演讲'],
     ['rmrb', '人民日报'],
     ['short', '每日短评'],
-  ].map(([k, name]) => `<a href="#/cards${k === 'ted' ? '' : '/' + k}" class="${cat === k ? 'active' : ''}">${name}</a>`).join('');
+  ].concat([['story', '订阅素材']]).map(([k, name]) => `<a href="#/cards${k === 'ted' ? '' : '/' + k}" class="${cat === k ? 'active' : ''}">${name}</a>`).join('');
 
   root.innerHTML = `
     <div class="view-tabs">${tabs}</div>
@@ -514,7 +532,7 @@ async function cards(root, sub = 'ted') {
       <div class="gen-row">
         <span class="dim">自动抓数字报评论版（人民时评 / 今日谈 / 人民论坛），每日 04:00 后可用</span>
         <button id="rmrb-btn" class="ghost">${iconBtn(ICONS.refresh, '抓取今日评论')}</button>
-      </div>` : `
+      </div>` : cat === 'short' ? `
       <div class="gen-row">
         <span class="dim">自动抓人民网观点频道最近 7 天短评（人民快评 / 壹时评等，300-1400 字）</span>
         <button id="short-btn" class="ghost">${iconBtn(ICONS.refresh, '抓取每日短评')}</button>
@@ -525,19 +543,26 @@ async function cards(root, sub = 'ted') {
         <input id="short-title" placeholder="标题（直接贴正文时填写）">
         <textarea id="short-content" placeholder="或直接粘贴短评正文（300 字以上）"></textarea>
         <button id="short-import" class="ghost">${iconBtn(ICONS.plus, '保存为短评素材')}</button>
-      </div>`}
+      </div>` : `
+      <div class="gen-row">
+        <span class="dim">每日自动抓取公开 RSS/Atom（AI 自动翻译英文、过滤网页噪声并整理中文段落）</span>
+        <button id="rss-btn" class="ghost">${iconBtn(ICONS.refresh, '立即抓取订阅源')}</button>
+        <button id="rss-reprocess-btn" class="ghost">整理已有素材</button>
+        <button id="rss-health-btn" class="ghost">查看来源状态</button>
+      </div>
+      <div id="rss-health" class="dim hidden"></div>`}
     <ul class="card-list">
       ${items.map((c) => `
         <li class="card-row">
           <div class="card-info">
             <b>${esc(c.title)}</b>
-            <span class="dim">${c.content.length} 字${lenBadge(c.content.length)} · ${esc(c.source || '')}${c.used_at ? ' · 练过' : ' · 未练'}</span>
+            <span class="dim">${materialDate(c.published_at)} · ${c.content.length} 字${lenBadge(c.content.length)} · ${sourceHtml(c.source)}${c.used_at ? ' · 练过' : ' · 未练'}</span>
           </div>
           <button class="practice-btn" data-id="${c.id}">直接练</button>
-        </li>`).join('') || `<li class="dim">「${esc(catMeta.name)}」还没有素材${cat === 'rmrb' ? '，点上面按钮抓取今日评论' : cat === 'short' ? '，点上面按钮抓取每日短评' : '，粘贴一个 TED 演讲链接导入'}</li>`}
+        </li>`).join('') || `<li class="dim">「${esc(catMeta.name)}」还没有素材${cat === 'rmrb' ? '，点上面按钮抓取今日评论' : cat === 'short' ? '，点上面按钮抓取每日短评' : cat === 'story' ? '，点上面按钮立即抓取订阅源' : '，粘贴一个 TED 演讲链接导入'}</li>`}
     </ul>`;
 
-  const btn = cat === 'ted' ? $('#ted-btn') : cat === 'rmrb' ? $('#rmrb-btn') : $('#short-btn');
+  const btn = cat === 'ted' ? $('#ted-btn') : cat === 'rmrb' ? $('#rmrb-btn') : cat === 'short' ? $('#short-btn') : $('#rss-btn');
   if (btn) {
     btn.addEventListener('click', async () => {
       btn.disabled = true;
@@ -549,10 +574,14 @@ async function cards(root, sub = 'ted') {
           const r = await api.post('/api/cards/fetch-ted', { url });
           toast(`《${r.title}》新增 ${r.added} 张卡` + (r.skipped ? `，跳过 ${r.skipped} 张` : ''));
           $('#ted-url').value = '';
-        } else {
+        } else if (cat === 'short') {
           btn.textContent = '抓取中…';
           const r = await api.post(cat === 'rmrb' ? '/api/cards/fetch-rmrb' : '/api/cards/fetch-short', {});
           toast(`新增 ${r.added} 篇` + (r.skipped ? `，跳过 ${r.skipped} 篇` : ''));
+        } else {
+          btn.textContent = '抓取中…';
+          const r = await api.post('/api/cards/fetch-rss', { maxPerFeed: 1, maxTotal: 6 });
+          toast(`订阅源新增 ${r.added} 篇` + (r.skipped ? `，跳过 ${r.skipped} 篇` : ''));
         }
         cards(root, cat);
       } catch (err) {
@@ -560,8 +589,39 @@ async function cards(root, sub = 'ted') {
       } finally {
         btn.disabled = false;
         if (cat === 'ted') btn.innerHTML = iconBtn(ICONS.sparkles, '导入 TED 演讲');
-        else btn.innerHTML = iconBtn(ICONS.refresh, cat === 'rmrb' ? '抓取今日评论' : '抓取每日短评');
+        else if (cat === 'rmrb') btn.innerHTML = iconBtn(ICONS.refresh, '抓取今日评论');
+        else if (cat === 'short') btn.innerHTML = iconBtn(ICONS.refresh, '抓取每日短评');
+        else btn.innerHTML = iconBtn(ICONS.refresh, '立即抓取订阅源');
       }
+    });
+  }
+
+  if (cat === 'story') {
+    const reprocessBtn = $('#rss-reprocess-btn');
+    if (reprocessBtn) reprocessBtn.addEventListener('click', async () => {
+      reprocessBtn.disabled = true;
+      reprocessBtn.textContent = '整理中…';
+      try {
+        const r = await api.post('/api/cards/reprocess-rss', {});
+        toast(`已重新整理 ${r.updated} 篇` + (r.skipped ? `，跳过 ${r.skipped} 篇` : ''));
+        cards(root, cat);
+      } catch (err) { toast(err.message); }
+      finally { reprocessBtn.disabled = false; reprocessBtn.textContent = '整理已有素材'; }
+    });
+    const healthBtn = $('#rss-health-btn');
+    const healthBox = $('#rss-health');
+    if (healthBtn && healthBox) healthBtn.addEventListener('click', async () => {
+      healthBtn.disabled = true;
+      try {
+        const r = await api.get('/api/feeds/health');
+        healthBox.classList.remove('hidden');
+        healthBox.innerHTML = r.feeds.map((f) => {
+          const when = f.lastItemAt ? new Date(f.lastItemAt).toLocaleString() : '尚未检查';
+          const status = f.status === 'ok' ? '正常' : f.status === 'disabled' ? '已停用' : f.status === 'never' ? '未检查' : f.status === 'empty' ? '空 feed' : f.status === 'checking' ? '检查中' : '失败';
+          return `<div>${esc(f.name)}：${status} · 最新条目 ${esc(when)}${f.error ? ` · ${esc(f.error)}` : ''}</div>`;
+        }).join('');
+      } catch (err) { toast(err.message); }
+      finally { healthBtn.disabled = false; }
     });
   }
 
@@ -1262,33 +1322,45 @@ async function bookshelf(root) {
   let data;
   try { data = await api.get('/api/bookshelf'); } catch (err) { root.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
   const BOOKS = data.books || [];
-  if (!BOOKS.length) {
-    root.innerHTML = `<div class="empty">书架是空的。把书（epub / pdf / docx / txt / md）放进 <b>${esc(data.dir)}</b> 目录，回来刷新。<br><span class="dim">子目录 = 一本书（目录名即书名）；epub/pdf 也可以直接放在目录根下。</span></div>`;
-    return;
-  }
+  const useCarousel = BOOKS.length >= 6;
   const half = Math.ceil(BOOKS.length / 2);
   const row = (items) => `
     <div class="shelf-viewport"><div class="shelf-track">
-      ${items.map(bookCard).join('')}${items.map(bookCard).join('')}
+      ${items.map(bookCard).join('')}${useCarousel ? items.map(bookCard).join('') : ''}
     </div></div>`;
   root.innerHTML = `
     <div class="page-wide">
       <div class="shelf-head">
         <h2>我的书架 <span class="count">${BOOKS.length} 本</span></h2>
-        <span class="dim shelf-dir" title="${esc(data.dir)}">${esc(data.dir)}</span>
+        <div class="shelf-import-actions">
+          <button class="primary" id="upload-epub">选择 EPUB</button>
+          <button id="upload-epub-folder">选择文件夹</button>
+          <input id="epub-files" type="file" accept=".epub,application/epub+zip" multiple hidden>
+          <input id="epub-folder" type="file" accept=".epub,application/epub+zip" webkitdirectory directory multiple hidden>
+        </div>
       </div>
-      <div class="shelf">
-        <button class="shelf-lr-btn" id="shelf-prev" title="后退一格" aria-label="后退">
+      <div class="shelf-upload-note">
+        <b>直接导入电子书</b>
+        <span class="dim">支持单本、多选或整个文件夹批量导入；只读取其中的 EPUB 文件，文件保存在本机。</span>
+        <span class="shelf-upload-status dim" id="shelf-upload-status"></span>
+      </div>
+      ${BOOKS.length ? `<div class="shelf ${useCarousel ? '' : 'shelf-static'}">
+        ${useCarousel ? `<button class="shelf-lr-btn" id="shelf-prev" title="后退一格" aria-label="后退">
           <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
         </button>
         <button class="shelf-lr-btn" id="shelf-next" title="前进一格" aria-label="前进">
           <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
-        </button>
-        ${row(BOOKS.slice(0, half))}
-        ${row(BOOKS.slice(half))}
+        </button>` : ''}
+        ${useCarousel ? `${row(BOOKS.slice(0, half))}${row(BOOKS.slice(half))}` : row(BOOKS)}
       </div>
-      <p class="dim shelf-tip">点击 ←/→ 滑动翻书 · 点击封面开始阅读 —— 目录选章 · 划线上色 · 每章读完立即复述感受</p>
+      <p class="dim shelf-tip">${useCarousel ? '点击 ←/→ 滑动翻书 · ' : ''}点击封面开始阅读 —— 目录选章 · 划线上色 · 每章读完立即复述感受</p>` : '<div class="empty shelf-empty">还没有图书，选择 EPUB 或一个包含 EPUB 的文件夹开始导入。</div>'}
     </div>`;
+  bindEpubUpload(root);
+  if (!BOOKS.length) return;
+  if (!useCarousel) {
+    root.querySelectorAll('.book-card').forEach((card) => card.addEventListener('click', () => openBook(card.dataset.id)));
+    return;
+  }
   // 滑动引擎：requestAnimationFrame 逐帧驱动（60fps 丝滑匀速），手动按钮做 easeOutCubic 补间 + 唰声
   const viewports = [...root.querySelectorAll('.shelf-viewport')];
   const tracks = viewports.map((vp) => vp.querySelector('.shelf-track'));
@@ -1326,6 +1398,49 @@ async function bookshelf(root) {
   window.addEventListener('hashchange', stopLoop);
   startLoop();
   root.querySelectorAll('.book-card').forEach((card) => card.addEventListener('click', () => { stopLoop(); openBook(card.dataset.id); }));
+}
+
+function bindEpubUpload(root) {
+  const fileInput = root.querySelector('#epub-files');
+  const folderInput = root.querySelector('#epub-folder');
+  const status = root.querySelector('#shelf-upload-status');
+  root.querySelector('#upload-epub').addEventListener('click', () => fileInput.click());
+  root.querySelector('#upload-epub-folder').addEventListener('click', () => folderInput.click());
+
+  const upload = async (fileList) => {
+    const epubs = [...fileList].filter((file) => file.name.toLowerCase().endsWith('.epub'));
+    if (!epubs.length) { toast('没有找到 EPUB 文件'); return; }
+    let added = 0;
+    let skipped = 0;
+    const failed = [];
+    for (let i = 0; i < epubs.length; i += 1) {
+      const file = epubs[i];
+      status.textContent = `正在导入 ${i + 1}/${epubs.length}：${file.name}`;
+      try {
+        const response = await fetch('/api/bookshelf/upload', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/epub+zip',
+            'X-File-Name': encodeURIComponent(file.webkitRelativePath || file.name),
+          },
+          body: file,
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(result.error || '上传失败');
+        if (result.added) added += 1;
+        else skipped += 1;
+      } catch (err) {
+        failed.push(`${file.name}：${err.message}`);
+      }
+    }
+    const summary = `导入完成：新增 ${added} 本${skipped ? `，跳过重复 ${skipped} 本` : ''}${failed.length ? `，失败 ${failed.length} 本` : ''}`;
+    await bookshelf(root);
+    toast(summary);
+    if (failed.length) console.warn('EPUB 导入失败', failed);
+  };
+
+  fileInput.addEventListener('change', () => upload(fileInput.files));
+  folderInput.addEventListener('change', () => upload(folderInput.files));
 }
 
 function bookCard(b) {
@@ -1433,7 +1548,10 @@ async function renderReader(root, id) {
       </div>
       <div class="reader-body">
         <aside class="reader-toc"><b>目录</b><ol id="toc-list">
-          ${nav.map((it, i) => `<li class="toc-item${(it.level || 1) > 1 ? ' toc-sub' : ''}" data-i="${i}" title="${esc(it.label)}">${esc(it.label)}</li>`).join('')}
+          ${nav.map((it, i) => {
+            const level = Math.max(1, Math.min(3, Number(it.level) || 1));
+            return `<li class="toc-item toc-level-${level}" data-i="${i}" title="${esc(it.label)}">${esc(it.label)}</li>`;
+          }).join('')}
         </ol></aside>
         <article class="reader-main">
           <div id="reader-crumb" class="reader-crumb"></div>
@@ -1745,6 +1863,242 @@ function hideSelPop() {
 }
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') hideSelPop(); });
 document.addEventListener('scroll', hideSelPop, true);
+
+// ---------- 面试刷题 ----------
+const INTERVIEW_STATE = { type: 'real', group: null, groups: { real: [], interview: [] }, groupQuestions: [], question: null, session: null, remaining: 180, timer: null, busy: false };
+
+function interviewClock(seconds) {
+  const value = Math.max(0, Number(seconds) || 0);
+  return `${String(Math.floor(value / 60)).padStart(2, '0')}:${String(value % 60).padStart(2, '0')}`;
+}
+
+function interviewSourceLabel(source) {
+  return source === 'ai' ? 'AI 总结' : '本地参考评分';
+}
+
+async function interview(root) {
+  clearInterval(INTERVIEW_STATE.timer);
+  INTERVIEW_STATE.timer = null;
+  root.className = 'interview-wrap';
+  root.innerHTML = '<div class="loading">正在读取面试题库…</div>';
+  let groups = { real: [], interview: [] };
+  try {
+    const [real, bank] = await Promise.all([
+      api.get('/api/interview/groups?type=real'),
+      api.get('/api/interview/groups?type=interview'),
+    ]);
+    groups = { real: real.groups || [], interview: bank.groups || [] };
+    INTERVIEW_STATE.groups = groups;
+  } catch (err) {
+    root.innerHTML = `<div class="empty">题库加载失败：${esc(err.message)}</div>`;
+    return;
+  }
+
+  const renderShell = () => {
+    root.innerHTML = `
+      <div class="interview-head">
+        <div>
+          <h2>面试刷题 <span class="count">${groups.real.reduce((n, item) => n + item.count, 0) + groups.interview.reduce((n, item) => n + item.count, 0)} 题</span></h2>
+          <p class="dim">先选择企业或题库模块，查看该范围的全部题目，再从范围内随机抽题，限时 3 分钟作答。</p>
+        </div>
+        <button class="ghost" data-records>练习记录</button>
+      </div>
+      <div class="interview-tabs">
+        <button class="interview-tab ${INTERVIEW_STATE.type === 'real' ? 'active' : ''}" data-type="real">企业真题 <span>${groups.real.reduce((n, item) => n + item.count, 0)}</span></button>
+        <button class="interview-tab ${INTERVIEW_STATE.type === 'interview' ? 'active' : ''}" data-type="interview">面试题库 <span>${groups.interview.reduce((n, item) => n + item.count, 0)}</span></button>
+      </div>
+      <div class="interview-panel" id="interview-panel"></div>`;
+    root.querySelectorAll('[data-type]').forEach((btn) => btn.addEventListener('click', () => {
+      INTERVIEW_STATE.type = btn.dataset.type;
+      root.querySelectorAll('[data-type]').forEach((item) => item.classList.toggle('active', item === btn));
+      if (!INTERVIEW_STATE.session || INTERVIEW_STATE.session.status === 'completed') {
+        INTERVIEW_STATE.group = null;
+        INTERVIEW_STATE.groupQuestions = [];
+        INTERVIEW_STATE.question = null;
+        INTERVIEW_STATE.session = null;
+        renderHome();
+      } else renderSession();
+    }));
+    root.querySelector('[data-records]').addEventListener('click', renderRecords);
+  };
+
+  const renderHome = () => {
+    const panel = $('#interview-panel');
+    if (!panel) return;
+    const availableGroups = groups[INTERVIEW_STATE.type] || [];
+    if (!INTERVIEW_STATE.group) {
+      panel.innerHTML = `
+        <div class="interview-group-picker">
+          <div class="interview-group-title"><div><h3>${INTERVIEW_STATE.type === 'real' ? '先选择企业' : '先选择题库模块'}</h3><p class="dim">${INTERVIEW_STATE.type === 'real' ? '按公司定位，查看该公司的全部真实面试题。' : '按模块定位，查看该模块的全部面试题。'}</p></div><span class="count">${availableGroups.length} 个${INTERVIEW_STATE.type === 'real' ? '企业' : '模块'}</span></div>
+          <div class="interview-group-grid">${availableGroups.map((item) => `<button class="interview-group" data-group="${esc(item.name)}"><span>${esc(item.name)}</span><em>${item.count} 题</em></button>`).join('')}</div>
+        </div>`;
+      panel.querySelectorAll('[data-group]').forEach((button) => button.addEventListener('click', () => selectGroup(button.dataset.group)));
+      return;
+    }
+    const q = INTERVIEW_STATE.question;
+    const list = INTERVIEW_STATE.groupQuestions || [];
+    panel.innerHTML = `
+      <div class="interview-scope-head"><div><button class="ghost" data-back-groups>← 返回${INTERVIEW_STATE.type === 'real' ? '企业' : '模块'}列表</button><h3>${esc(INTERVIEW_STATE.group.name)}</h3><p class="dim">${list.length} 道题 · 先浏览全部题目，再从本${INTERVIEW_STATE.type === 'real' ? '企业' : '模块'}抽题</p></div></div>
+      <div class="interview-card interview-picker">
+        <div class="interview-card-kicker">${INTERVIEW_STATE.type === 'real' ? '企业真题' : '面试题库'} · 本${INTERVIEW_STATE.type === 'real' ? '企业' : '模块'}随机练习</div>
+        ${q ? `<div class="interview-question">${esc(q.question)}</div>
+          <div class="interview-meta"><span>${esc(q.category)}</span><span>${esc(q.source)} · 第 ${q.number} 题</span></div>` : `
+          <div class="interview-empty-question">浏览下面的全部题目后，点击“从本组随机抽题”</div>`}
+        <div class="interview-actions">
+          <button class="ghost" data-random-group>${q ? '换一道' : '从本组随机抽题'}</button>
+          ${q ? '<button class="primary" data-start>开始 3 分钟练习</button>' : ''}
+        </div>
+      </div>
+      <div class="interview-question-list-wrap"><div class="interview-list-head"><b>全部题目</b><span class="count">${list.length} 题</span></div><ol class="interview-question-list">${list.map((item, index) => `<li><span class="interview-question-no">${index + 1}</span><span>${esc(item.question)}</span></li>`).join('')}</ol></div>
+      <div class="interview-note"><b>练习流程</b><span>选${INTERVIEW_STATE.type === 'real' ? '企业' : '模块'}</span><i>→</i><span>看完全部题目</span><i>→</i><span>本组随机抽题</span><i>→</i><span>3 分钟回答</span></div>`;
+    panel.querySelector('[data-back-groups]').addEventListener('click', () => { INTERVIEW_STATE.group = null; INTERVIEW_STATE.groupQuestions = []; INTERVIEW_STATE.question = null; INTERVIEW_STATE.session = null; renderHome(); });
+    panel.querySelector('[data-random-group]').addEventListener('click', loadQuestion);
+    panel.querySelector('[data-start]')?.addEventListener('click', startQuestion);
+  };
+
+  const selectGroup = async (category) => {
+    const group = (groups[INTERVIEW_STATE.type] || []).find((item) => item.name === category);
+    if (!group) return;
+    const panel = $('#interview-panel');
+    if (panel) panel.innerHTML = '<div class="loading">正在读取该范围的全部题目…</div>';
+    try {
+      const result = await api.get(`/api/interview/questions?type=${INTERVIEW_STATE.type}&category=${encodeURIComponent(category)}`);
+      INTERVIEW_STATE.group = group;
+      INTERVIEW_STATE.groupQuestions = result.questions || [];
+      INTERVIEW_STATE.question = null;
+      INTERVIEW_STATE.session = null;
+      renderHome();
+    } catch (err) { toast(err.message); renderHome(); }
+  };
+
+  const loadQuestion = async () => {
+    if (!INTERVIEW_STATE.group) return;
+    const button = root.querySelector('[data-random-group]');
+    if (button) { button.disabled = true; button.textContent = '抽取中…'; }
+    try {
+      const result = await api.get(`/api/interview/questions/random?type=${INTERVIEW_STATE.type}&category=${encodeURIComponent(INTERVIEW_STATE.group.name)}`);
+      INTERVIEW_STATE.question = result.question;
+      INTERVIEW_STATE.session = null;
+      renderHome();
+    } catch (err) { toast(err.message); if (button) { button.disabled = false; button.textContent = '从本组随机抽题'; } }
+  };
+
+  const startQuestion = async () => {
+    if (!INTERVIEW_STATE.question) return;
+    try {
+      const result = await api.post('/api/interview/practice/start', { questionId: INTERVIEW_STATE.question.id });
+      INTERVIEW_STATE.session = result.session;
+      INTERVIEW_STATE.remaining = 180;
+      renderSession();
+    } catch (err) { toast(err.message); }
+  };
+
+  const stopInterviewTimer = () => {
+    clearInterval(INTERVIEW_STATE.timer);
+    INTERVIEW_STATE.timer = null;
+  };
+
+  const renderSession = () => {
+    const panel = $('#interview-panel');
+    const current = INTERVIEW_STATE.session;
+    if (!panel || !current) return renderHome();
+    if (current.status === 'answering') {
+      panel.innerHTML = `
+        <div class="interview-card interview-live">
+          <div class="interview-live-top"><span class="badge">${esc(current.typeName)}</span><span class="interview-meta">${esc(current.category)} · ${esc(current.source)}</span><strong id="interview-clock">${interviewClock(INTERVIEW_STATE.remaining)}</strong></div>
+          <h3>${esc(current.question.question)}</h3>
+          <p class="dim">先说清结论，再按要点展开；时间到会自动提交当前内容。</p>
+          <textarea id="interview-answer" class="interview-textarea" placeholder="在这里输入你的回答…"></textarea>
+          <div class="interview-actions"><button class="ghost" data-cancel>换一道</button><button class="primary" data-submit>提交回答</button></div>
+        </div>`;
+      panel.querySelector('[data-cancel]').addEventListener('click', () => { stopInterviewTimer(); INTERVIEW_STATE.session = null; INTERVIEW_STATE.question = null; renderHome(); });
+      panel.querySelector('[data-submit]').addEventListener('click', () => submitAnswer(false));
+      stopInterviewTimer();
+      INTERVIEW_STATE.timer = setInterval(() => {
+        if (!location.hash.startsWith('#/interview')) { stopInterviewTimer(); return; }
+        INTERVIEW_STATE.remaining -= 1;
+        const clock = $('#interview-clock');
+        if (clock) { clock.textContent = interviewClock(INTERVIEW_STATE.remaining); clock.classList.toggle('warning', INTERVIEW_STATE.remaining <= 45); }
+        if (INTERVIEW_STATE.remaining <= 0) submitAnswer(true);
+      }, 1000);
+      return;
+    }
+    stopInterviewTimer();
+    const summary = current.summary || {};
+    if (current.status === 'review') {
+      panel.innerHTML = reviewHtml(current, summary, false);
+      panel.querySelector('[data-restate]').addEventListener('click', submitRestate);
+      panel.querySelector('[data-new]').addEventListener('click', () => { INTERVIEW_STATE.session = null; INTERVIEW_STATE.question = null; renderHome(); });
+    } else {
+      panel.innerHTML = reviewHtml(current, current.restateSummary || summary, true);
+      panel.querySelector('[data-new]').addEventListener('click', () => { INTERVIEW_STATE.session = null; INTERVIEW_STATE.question = null; renderHome(); });
+    }
+  };
+
+  const reviewHtml = (current, summary, completed) => `
+    <div class="interview-card interview-review">
+      <div class="interview-review-head"><div><span class="badge">${esc(current.typeName)}</span><span class="interview-meta">${esc(current.category)} · ${esc(current.source)}</span></div><div class="interview-score">${summary.score ?? 0}<small>/100</small></div></div>
+      <h3>${esc(current.question.question)}</h3>
+      <div class="interview-source">${interviewSourceLabel(summary.source)} · ${completed ? '已完成复述并保存' : '首次回答复盘'}</div>
+      <div class="interview-summary"><b>总结</b><p>${esc(summary.summary)}</p></div>
+      <div class="interview-columns"><div><b>做得好的</b><ul>${(summary.strengths || []).map((x) => `<li>${esc(x)}</li>`).join('') || '<li>暂无</li>'}</ul></div><div><b>下一步补强</b><ul>${(summary.gaps || []).map((x) => `<li>${esc(x)}</li>`).join('') || '<li>暂无</li>'}</ul></div></div>
+      <div class="interview-suggestions"><b>下一次怎么答</b><ul>${(summary.suggestions || []).map((x) => `<li>${esc(x)}</li>`).join('') || '<li>先给结论，再按要点展开，最后用结果数据收尾。</li>'}</ul></div>
+      <details class="interview-reference"><summary>查看标准答案 / 参考框架</summary><p>${esc(summary.referenceAnswer || current.question.standardAnswer || '')}</p></details>
+      <div class="interview-answer-box"><b>我的首次回答</b><p>${esc(current.firstAnswer || '')}</p></div>
+      ${completed ? `<div class="interview-answer-box"><b>我的复述</b><p>${esc(current.restateAnswer || '')}</p></div>` : `<div class="interview-restate"><b>再复述一次</b><p class="dim">根据上面的总结，用自己的话重新回答这道题。</p><textarea id="interview-restate" class="interview-textarea" placeholder="重新组织后再回答…"></textarea><button class="primary" data-restate>提交复述并保存</button></div>`}
+      <div class="interview-actions"><button class="ghost" data-new>再抽一道</button></div>
+    </div>`;
+
+  const submitAnswer = async (timedOut) => {
+    if (INTERVIEW_STATE.busy || !INTERVIEW_STATE.session || INTERVIEW_STATE.session.status !== 'answering') return;
+    const textarea = $('#interview-answer');
+    const answer = textarea?.value.trim() || (timedOut ? '（时间到，未完成回答）' : '');
+    if (!answer) return toast('请先输入回答');
+    INTERVIEW_STATE.busy = true;
+    stopInterviewTimer();
+    const button = root.querySelector('[data-submit]');
+    if (button) { button.disabled = true; button.textContent = '总结中…'; }
+    try {
+      const result = await api.post(`/api/interview/practice/${INTERVIEW_STATE.session.id}/answer`, { answer });
+      INTERVIEW_STATE.session = result.session;
+      renderSession();
+      if (timedOut) toast('时间到，已提交并完成复盘');
+    } catch (err) { toast(err.message); if (INTERVIEW_STATE.session?.status === 'answering') renderSession(); }
+    finally { INTERVIEW_STATE.busy = false; }
+  };
+
+  const submitRestate = async () => {
+    if (INTERVIEW_STATE.busy || !INTERVIEW_STATE.session) return;
+    const answer = $('#interview-restate')?.value.trim();
+    if (!answer) return toast('请先输入复述内容');
+    INTERVIEW_STATE.busy = true;
+    const button = root.querySelector('[data-restate]');
+    if (button) { button.disabled = true; button.textContent = '保存并总结中…'; }
+    try {
+      const result = await api.post(`/api/interview/practice/${INTERVIEW_STATE.session.id}/restate`, { answer });
+      INTERVIEW_STATE.session = result.session;
+      renderSession();
+      toast('复述已保存');
+    } catch (err) { toast(err.message); if (button) { button.disabled = false; button.textContent = '提交复述并保存'; } }
+    finally { INTERVIEW_STATE.busy = false; }
+  };
+
+  const renderRecords = async () => {
+    const panel = $('#interview-panel');
+    if (!panel) return;
+    panel.innerHTML = '<div class="loading">正在读取练习记录…</div>';
+    try {
+      const result = await api.get('/api/interview/records');
+      const records = result.records || [];
+      panel.innerHTML = `<div class="interview-records"><div class="interview-records-head"><h3>练习记录 <span class="count">${records.length}</span></h3><button class="ghost" data-back>返回抽题</button></div>${records.length ? records.map((record) => `<details class="interview-record"><summary><span><b>${esc(record.typeName)}</b> · ${esc(record.category)} · ${esc(record.question.question)}</span><em>${record.summary ? `${record.summary.score}/100` : '未完成'} · ${new Date(record.createdAt).toLocaleString('zh-CN')}</em></summary><div class="interview-record-body"><p><b>首次回答：</b>${esc(record.firstAnswer || '尚未提交')}</p>${record.summary ? `<p><b>复盘：</b>${esc(record.summary.summary)}</p>` : ''}${record.restateAnswer ? `<p><b>复述：</b>${esc(record.restateAnswer)}</p><p><b>复述评分：</b>${record.restateSummary?.score ?? 0}/100</p>` : ''}</div></details>`).join('') : '<div class="empty">还没有练习记录，先抽一道题试试。</div>'}</div>`;
+      panel.querySelector('[data-back]').addEventListener('click', renderHome);
+    } catch (err) { panel.innerHTML = `<div class="empty">记录加载失败：${esc(err.message)}</div>`; }
+  };
+
+  renderShell();
+  if (INTERVIEW_STATE.session && INTERVIEW_STATE.session.status !== 'completed') renderSession();
+  else renderHome();
+}
 
 // ---------- 词库 ----------
 async function words(root) {  root.innerHTML = '<div class="loading">加载中…</div>';

@@ -5,8 +5,9 @@ const fs = require('node:fs');
 const db = require('./db');
 const { chat, parseJson, isConfigured, healthCheck } = require('./llm');
 const prompts = require('./prompts');
-const { fetchAndImport, importTed, importRmrb, importDailyShort, importShort } = require('./fetch_cards');
+const { fetchAndImport, reprocessFeedCards, getFeedHealth, importTed, importRmrb, importDailyShort, importShort } = require('./fetch_cards');
 const shelf = require('./bookshelf');
+const interviewTrainer = require('./interview-trainer');
 
 // 口语词词库：收尾报告时扫描命中（识别口语词/语气词/口头禅并给替换建议）
 const WORD_BANK = (() => {
@@ -90,18 +91,18 @@ app.get('/api/cards', (req, res) => {
 });
 
 app.post('/api/cards', (req, res) => {
-  const { title, content, source } = req.body || {};
+  const { title, content, source, publishedAt } = req.body || {};
   if (!title || !title.trim() || !content || !content.trim()) {
     return res.status(400).json({ error: 'title 和 content 不能为空' });
   }
-  const id = db.createCard({ title: title.trim(), content: content.trim(), source: (source || '').trim() });
+  const id = db.createCard({ title: title.trim(), content: content.trim(), source: (source || '').trim(), publishedAt });
   res.json({ id });
 });
 
 // ---------- 练习选卡：板块 -> 完整素材（短素材优先，适配复述） ----------
 app.post('/api/practice/pick', (req, res) => {
   const category = String((req.body || {}).category || '');
-  if (!['ted', 'rmrb', 'short'].includes(category)) return res.status(400).json({ error: '板块必须是 ted / rmrb / short' });
+  if (!['ted', 'rmrb', 'short', 'story'].includes(category)) return res.status(400).json({ error: '板块必须是 ted / rmrb / short / story' });
 
   const all = db.listCardsByCategory(category);
   if (!all.length) return res.status(404).json({ error: '该板块还没有素材，先去素材库导入' });
@@ -157,6 +158,38 @@ app.post('/api/cards/fetch-ted', async (req, res) => {
     console.error('[ted error]', err.message);
     res.status(502).json({ error: err.message });
   }
+});
+
+// RSS/Atom 订阅源：手动立即抓取（自动任务每天也会调用同一流程）
+app.post('/api/cards/fetch-rss', async (req, res) => {
+  const maxPerFeed = Math.max(1, Math.min(5, Number(req.body?.maxPerFeed) || 1));
+  const maxTotal = Math.max(1, Math.min(20, Number(req.body?.maxTotal) || 6));
+  try {
+    const result = await fetchAndImport({
+      maxPerFeed,
+      maxTotal,
+      onLog: (s) => console.log('[rss]', s),
+    });
+    res.json({ added: result.added.length, skipped: result.skipped.length, feeds: result.feeds });
+  } catch (err) {
+    console.error('[rss error]', err.message);
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.post('/api/cards/reprocess-rss', async (_req, res) => {
+  try {
+    const result = await reprocessFeedCards({ onLog: (s) => console.log('[rss 整理]', s) });
+    res.json({ updated: result.updated.length, skipped: result.skipped.length, details: result.skipped });
+  } catch (err) {
+    console.error('[rss reprocess error]', err.message);
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// 订阅源健康状态（进程重启后会重新从 never 开始，下一次抓取会填充）
+app.get('/api/feeds/health', (req, res) => {
+  res.json({ feeds: getFeedHealth() });
 });
 
 // ---------- 练习会话 ----------
@@ -315,6 +348,21 @@ app.get('/api/bookshelf', (req, res) => {
   res.json({ books, dir: shelf.ROOT });
 });
 
+app.post('/api/bookshelf/upload', express.raw({
+  type: ['application/epub+zip', 'application/octet-stream'],
+  limit: '200mb',
+}), (req, res) => {
+  let filename = req.get('x-file-name') || '';
+  try { filename = decodeURIComponent(filename); } catch { /* 使用原始文件名继续校验 */ }
+  if (!filename) return res.status(400).json({ error: '缺少文件名' });
+  try {
+    const result = shelf.importEpub(req.body, filename);
+    res.status(result.added ? 201 : 200).json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
 app.get('/api/bookshelf/:id/cover', (req, res) => {
   try {
     const buf = shelf.getCover(req.params.id);
@@ -445,19 +493,82 @@ app.delete('/api/bookshelf/:id/marks/:mid', (req, res) => {
   res.json({ ok: db.deleteBookMark(Number(req.params.mid), req.params.id) });
 });
 
-// 每日自动抓人民日报评论版 + 每日短评（启动 5 分钟后 + 每 24 小时）
+// ---------- 面试刷题（北梦测题库） ----------
+app.get('/api/interview/groups', (req, res) => {
+  const type = String(req.query.type || '');
+  if (type && !['real', 'interview'].includes(type)) return res.status(400).json({ error: '题目类型无效' });
+  const groups = new Map();
+  interviewTrainer.allQuestions().filter((item) => !type || item.type === type).forEach((item) => {
+    const key = `${item.type}:${item.category}`;
+    if (!groups.has(key)) groups.set(key, { type: item.type, name: item.category, count: 0 });
+    groups.get(key).count += 1;
+  });
+  res.json({ groups: [...groups.values()].sort((a, b) => a.name.localeCompare(b.name, 'zh-CN')) });
+});
+
+app.get('/api/interview/questions', (req, res) => {
+  const type = String(req.query.type || '');
+  if (type && !['real', 'interview'].includes(type)) return res.status(400).json({ error: '题目类型无效' });
+  const category = String(req.query.category || '');
+  const all = interviewTrainer.allQuestions().filter((item) => (!type || item.type === type) && (!category || item.category === category));
+  const categories = {};
+  all.forEach((item) => { categories[item.category] = (categories[item.category] || 0) + 1; });
+  res.json({ questions: all.map((item) => interviewTrainer.publicQuestion(item)), categories });
+});
+
+app.get('/api/interview/questions/random', (req, res) => {
+  const type = String(req.query.type || '');
+  if (type && !['real', 'interview'].includes(type)) return res.status(400).json({ error: '题目类型无效' });
+  const category = String(req.query.category || '');
+  const pool = interviewTrainer.allQuestions().filter((item) => (!type || item.type === type) && (!category || item.category === category));
+  const question = pool[Math.floor(Math.random() * pool.length)];
+  if (!question) return res.status(404).json({ error: '没有找到符合条件的题目' });
+  res.json({ question: interviewTrainer.publicQuestion(question) });
+});
+
+app.get('/api/interview/records', (req, res) => {
+  res.json({ records: interviewTrainer.listRecords().slice(0, 100) });
+});
+
+app.post('/api/interview/practice/start', async (req, res) => {
+  try { res.status(201).json({ session: await interviewTrainer.start(String(req.body?.questionId || '')) }); }
+  catch (error) { res.status(400).json({ error: error.message }); }
+});
+
+app.post('/api/interview/practice/:id/answer', async (req, res) => {
+  try { res.json({ session: await interviewTrainer.answer(req.params.id, req.body?.answer) }); }
+  catch (error) { res.status(/不存在/.test(error.message) ? 404 : 409).json({ error: error.message }); }
+});
+
+app.post('/api/interview/practice/:id/restate', async (req, res) => {
+  try { res.json({ session: await interviewTrainer.restate(req.params.id, req.body?.answer) }); }
+  catch (error) { res.status(/不存在/.test(error.message) ? 404 : 409).json({ error: error.message }); }
+});
+
+// 每日自动抓 RSS 订阅源 + 人民日报评论版 + 每日短评（启动 5 分钟后 + 每 24 小时）
 let autoFetchedDay = '';
+let autoFetchRunning = false;
 async function autoFetch() {
   const day = db.localDayKey();
-  if (autoFetchedDay === day) return; // 今天已抓过
-  autoFetchedDay = day;
-  for (const [name, fn] of [['人民日报评论版', importRmrb], ['每日短评', importDailyShort]]) {
-    try {
-      const { added, skipped } = await fn({ onLog: (s) => console.log(`[自动抓${name}]`, s) });
-      console.log(`[自动抓${name}] 新增 ${added.length} 条，跳过 ${skipped.length} 条`);
-    } catch (err) {
-      console.error(`[自动抓${name}失败]`, err.message);
+  if (autoFetchedDay === day || autoFetchRunning) return; // 今天已抓过/正在抓
+  autoFetchRunning = true;
+  try {
+    const jobs = [
+      ['RSS 订阅源', () => fetchAndImport({ maxPerFeed: 1, maxTotal: 6, onLog: (s) => console.log('[自动抓RSS]', s) })],
+      ['人民日报评论版', importRmrb],
+      ['每日短评', importDailyShort],
+    ];
+    for (const [name, fn] of jobs) {
+      try {
+        const { added, skipped } = await fn({ onLog: (s) => console.log(`[自动抓${name}]`, s) });
+        console.log(`[自动抓${name}] 新增 ${added.length} 条，跳过 ${skipped.length} 条`);
+      } catch (err) {
+        console.error(`[自动抓${name}失败]`, err.message);
+      }
     }
+    autoFetchedDay = day;
+  } finally {
+    autoFetchRunning = false;
   }
 }
 

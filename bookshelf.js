@@ -1,4 +1,4 @@
-// 本地读书：扫描 BOOKS_DIR（默认 E:\Shawn\opencode\读书），解析 epub / pdf / docx / txt / md → 章节
+// 本地读书：扫描项目内上传书库（可用 BOOKS_DIR 覆盖），解析 epub / pdf / docx / txt / md → 章节
 // 支持：epub（ZIP+OPF+spine）、pdf（pdf-parse）、docx（mammoth）、txt/md（标题切章）
 // 每本书：{ id, title, author?, format, file, chapterFile? }，GET 时解析章节 + 封面
 const fs = require('node:fs');
@@ -7,13 +7,15 @@ const crypto = require('node:crypto');
 const AdmZip = require('adm-zip');
 const { DOMParser } = require('@xmldom/xmldom');
 
-const ROOT = process.env.BOOKS_DIR || 'E:\\Shawn\\opencode\\读书';
+const ROOT = path.resolve(process.env.BOOKS_DIR || path.join(__dirname, 'data', 'books'));
 const IGNORE_DIR = /node_modules|\.dsh|harness|video|model|\.git|\.omo|extract_books|assets?/i;
 const BOOK_EXTS = ['.epub', '.pdf', '.docx', '.txt', '.md', '.mobi', '.azw3'];
 const CHUNK = 2000; // 无章节结构的文本按此字数切章
 const IMG_DIR = path.join(__dirname, 'data', 'imgs'); // 图片缓存：PDF 页面渲染 / epub 内嵌图
 const PDF_SCALE = 2; // PDF 页渲染倍率（页图 PNG 与透明文字层共用，改这里需清 data/imgs/pdf 缓存）
 let mupdfDoc = null; // 当前打开的 PDF 文档（懒加载）
+
+fs.mkdirSync(ROOT, { recursive: true });
 
 // zip 内路径归一化（防穿越 + 统一斜杠）
 const normPath = (p) => path.posix.normalize(('/' + String(p || '').replace(/\\/g, '/').replace(/^\/+/, '')).replace(/\/+/g, '/')).replace(/^\/+/, '');
@@ -68,6 +70,43 @@ function scanBooks() {
   }
   books.sort((a, b) => a.title.localeCompare(b.title, 'zh'));
   return books;
+}
+
+// 浏览器上传 EPUB：只接受结构有效的 EPUB，重名且内容相同则跳过，内容不同则自动编号。
+function importEpub(buffer, originalName) {
+  if (!Buffer.isBuffer(buffer) || !buffer.length) throw new Error('上传文件为空');
+
+  const rawName = path.basename(String(originalName || 'book.epub').replace(/\\/g, '/'));
+  if (path.extname(rawName).toLowerCase() !== '.epub') throw new Error('只支持上传 EPUB 文件');
+
+  try {
+    const zip = new AdmZip(buffer);
+    if (!zip.getEntry('META-INF/container.xml')) throw new Error('缺少 META-INF/container.xml');
+  } catch (err) {
+    throw new Error(`不是有效的 EPUB 文件：${err.message}`);
+  }
+
+  const safeBase = path.basename(rawName, path.extname(rawName))
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, '_')
+    .replace(/[. ]+$/g, '')
+    .trim() || '未命名图书';
+  let filename = `${safeBase}.epub`;
+  let target = path.join(ROOT, filename);
+  let copy = 2;
+
+  while (fs.existsSync(target)) {
+    const current = fs.readFileSync(target);
+    if (current.length === buffer.length && current.equals(buffer)) {
+      const book = scanBooks().find((item) => item.id === idOf(filename));
+      return { added: false, book };
+    }
+    filename = `${safeBase} (${copy++}).epub`;
+    target = path.join(ROOT, filename);
+  }
+
+  fs.writeFileSync(target, buffer, { flag: 'wx' });
+  const book = scanBooks().find((item) => item.id === idOf(filename));
+  return { added: true, book };
 }
 
 function countFiles(dir) {
@@ -291,8 +330,11 @@ function parseEpubToc(zip, opfDoc, manifest, opfPath, spine) {
         (function walkNav(el, level) {
           for (const np of Array.from(el.childNodes || [])) {
             if (np.nodeType !== 1 || np.localName !== 'navPoint') continue;
-            const label = byTag(np, 'text').map((t) => t.textContent || '').join('').trim();
-            const content = byTag(np, 'content')[0];
+            // 只取当前 navPoint 自己的 navLabel，避免把嵌套小节的标题拼进章标题。
+            const navLabel = Array.from(np.childNodes || []).find((n) => n.nodeType === 1 && n.localName === 'navLabel');
+            const labelNode = navLabel && Array.from(navLabel.childNodes || []).find((n) => n.nodeType === 1 && n.localName === 'text');
+            const label = (labelNode?.textContent || '').trim();
+            const content = Array.from(np.childNodes || []).find((n) => n.nodeType === 1 && n.localName === 'content');
             const src = content ? content.getAttribute('src') || '' : '';
             const [base, anchor] = src.split('#');
             // src 规范上相对 ncx 所在目录；个别书相对 OPF 目录 → 两个都试
@@ -1216,4 +1258,4 @@ function getRes(id, p) {
   } catch { return null; }
 }
 
-module.exports = { scanBooks, getBook, getCover, pagePng, pageStructuredText, getBookImg, getChapterRaw, getRawAll, getSpineContent, getRes, ROOT };
+module.exports = { scanBooks, importEpub, getBook, getCover, pagePng, pageStructuredText, getBookImg, getChapterRaw, getRawAll, getSpineContent, getRes, ROOT };

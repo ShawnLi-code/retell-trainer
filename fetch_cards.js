@@ -7,37 +7,104 @@
 // 说明：
 //   - 未配置 LLM_API_KEY 时跳过 AI 筛选，直接入库所有长度合格的条目（慎用）
 //   - RSSHub 公共实例不稳定，长期使用建议自建：docker run -p 1200:1200 diygod/rsshub
-//   - 在下方 FEEDS 里按需增删源，格式 { name, url }
+//   - 在下方 FEEDS 里按需增删源；抓取任务每天自动运行一次
 
 const db = require('./db');
 const { chat, parseJson, isConfigured } = require('./llm');
 
 // ---------- RSS 源配置 ----------
+// 这些源都提供公开 RSS/Atom。多数 feed 只给摘要，所以 fetchArticle=true 时会
+// 在摘要太短时再抓文章页；本项目是本地个人训练，仍应保留来源链接，不要公开转载全文。
 const FEEDS = [
-  { name: '故事FM', url: 'https://storyfm.cn/feed/' },
-  { name: '少数派', url: 'https://sspai.com/feed' },
-  { name: '阮一峰的网络日志', url: 'https://www.ruanyifeng.com/blog/atom.xml' },
-  // 自建 RSSHub（http://localhost:1200）后可取消注释，示例路由：
-  // { name: '人民日报评论', url: 'http://localhost:1200/people/opinion' },
-  // { name: '知乎日报', url: 'http://localhost:1200/zhihu/daily' },
-  // { name: '澎湃新闻·思想', url: 'http://localhost:1200/thepaper/featured' },
-  // 更多路由查 https://docs.rsshub.app
+  { name: '少数派', url: 'https://sspai.com/feed', fetchArticle: true },
+  { name: '美团技术团队', url: 'https://tech.meituan.com/feed/', fetchArticle: true },
+  { name: 'MIT News · Research', url: 'https://news.mit.edu/rss/research', fetchArticle: true },
+  { name: 'NASA · Technology', url: 'https://www.nasa.gov/technology/feed/', fetchArticle: true },
+  { name: 'NASA · News Release', url: 'https://www.nasa.gov/news-release/feed/', fetchArticle: true },
+  { name: 'Ars Technica', url: 'https://feeds.arstechnica.com/arstechnica/index', fetchArticle: true },
+  // 周更但质量稳定，作为补充来源，不保证每天有新条目。
+  { name: '阮一峰的网络日志', url: 'https://www.ruanyifeng.com/blog/atom.xml', fetchArticle: true },
+  // BBC feed 更新很快，但条款限制更严格；仅保留摘要，不抓全文。
+  // 当前 Windows/Node 环境与 BBC 的 TLS 握手失败，先保留配置但默认停用，避免每日任务反复报错。
+  { name: 'BBC World', url: 'https://feeds.bbci.co.uk/news/world/rss.xml', fetchArticle: false, minLength: 180, enabled: false },
+  // 需要自建 RSSHub 时可在这里继续增加来源：
+  // { name: '知乎日报', url: 'http://localhost:1200/zhihu/daily', fetchArticle: true },
+  // { name: '澎湃新闻·思想', url: 'http://localhost:1200/thepaper/featured', fetchArticle: true },
 ];
+
+const FEED_TIMEOUT_MS = 25_000;
+const feedHealth = new Map();
+
+function healthFor(feed) {
+  if (!feedHealth.has(feed.url)) {
+    feedHealth.set(feed.url, {
+      name: feed.name,
+      url: feed.url,
+      status: feed.enabled === false ? 'disabled' : 'never',
+      lastCheckedAt: null,
+      lastSuccessAt: null,
+      lastItemAt: null,
+      itemCount: 0,
+      addedCount: 0,
+      skippedCount: 0,
+      error: '',
+    });
+  }
+  return feedHealth.get(feed.url);
+}
+
+function updateHealth(feed, patch) {
+  Object.assign(healthFor(feed), patch);
+}
+
+function getFeedHealth() {
+  return FEEDS.map((feed) => ({ ...healthFor(feed), enabled: feed.enabled !== false, fetchArticle: feed.fetchArticle !== false }));
+}
 
 // ---------- 工具 ----------
 function decodeEntities(s) {
   return String(s)
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
     .replace(/&amp;/g, '&')
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
     .replace(/&#39;|&apos;/g, "'")
-    .replace(/&nbsp;/g, ' ');
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&#(\d+);/g, (_, n) => {
+      try { return String.fromCodePoint(Number(n)); } catch { return ''; }
+    })
+    .replace(/&#x([\da-f]+);/gi, (_, n) => {
+      try { return String.fromCodePoint(parseInt(n, 16)); } catch { return ''; }
+    });
 }
 
 function stripHtml(s) {
-  return decodeEntities(String(s).replace(/<[^>]+>/g, ' '))
+  return decodeEntities(String(s))
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
     .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function htmlToParagraphText(s) {
+  return decodeEntities(String(s || ''))
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<(?:br|hr)\b[^>]*\/?>/gi, '\n\n')
+    .replace(/<\/(?:p|div|h[1-6]|blockquote|li|section|article)>/gi, '\n\n')
+    .replace(/<[^>]+>/g, ' ')
+    .split(/\n+/)
+    .map((line) => line.replace(/[ \t]+/g, ' ').trim())
+    .filter(Boolean)
+    .join('\n\n');
+}
+
+function cleanFeedText(s) {
+  return String(s || '')
+    .replace(/\s+(?:Read|View) full article(?:\s+Comments?)?\s*$/i, '')
+    .replace(/\s+The post [\s\S]+? appeared first on [\s\S]+$/i, '')
     .trim();
 }
 
@@ -56,81 +123,260 @@ function extractItems(xml) {
     const title = stripHtml(grab('title'));
     // 正文：content:encoded > content > description
     let content = grab('content:encoded') || grab('content') || grab('description');
-    content = stripHtml(content);
-    if (title && content) items.push({ title, content });
+    content = cleanFeedText(htmlToParagraphText(content));
+    const linkTag = [...block.matchAll(/<link\b([^>]*)>/gi)]
+      .map((x) => x[1] || '')
+      .find((attrs) => !/rel\s*=\s*["']self["']/i.test(attrs));
+    const href = linkTag?.match(/\bhref\s*=\s*["']([^"']+)["']/i)?.[1] || '';
+    const textLink = stripHtml(grab('link'));
+    const guid = stripHtml(grab('guid') || grab('id'));
+    const link = href || textLink || (guid.startsWith('http') ? guid : '');
+    let publishedAt = stripHtml(grab('pubDate') || grab('published') || grab('updated') || grab('dc:date'));
+    if (!publishedAt) {
+      const dateInUrl = link.match(/\/(20\d{2})\/(\d{2})\/(\d{2})\//);
+      if (dateInUrl) publishedAt = `${dateInUrl[1]}-${dateInUrl[2]}-${dateInUrl[3]}T00:00:00Z`;
+    }
+    if (title) items.push({ title, content, link, guid, publishedAt });
   }
   return items;
 }
 
-// 已存在检查（按标题去重）
-function exists(title) {
-  return !!db.listCards().find((c) => c.title === title);
+async function fetchArticleText(url) {
+  if (!url) return '';
+  const res = await fetch(url, {
+    headers: {
+      'User-Agent': 'retell-trainer/1.0 (local retelling practice)',
+      'Accept': 'text/html,application/xhtml+xml',
+    },
+    signal: AbortSignal.timeout(FEED_TIMEOUT_MS),
+  });
+  if (!res.ok) throw new Error(`文章页 HTTP ${res.status}`);
+  const html = await res.text();
+  // 优先使用 article/main，避免把导航和页脚送给模型；没有语义容器时退回全文 p。
+  const segment = html.match(/<article\b[^>]*>[\s\S]*?<\/article>/i)?.[0]
+    || html.match(/<main\b[^>]*>[\s\S]*?<\/main>/i)?.[0]
+    || html;
+  const paragraphs = [...segment.matchAll(/<(?:p|h2|h3|blockquote)\b[^>]*>([\s\S]*?)<\/(?:p|h2|h3|blockquote)>/gi)]
+    .map((m) => stripHtml(m[1]))
+    .filter((p) => p.length >= 20 && !/cookie|subscribe|newsletter|copyright|登录|注册/i.test(p));
+  return cleanFeedText([...new Set(paragraphs)].join('\n\n'));
 }
 
-// ---------- LLM 筛选 ----------
-const filterSystem = `你是一位内容编辑，为"口头复述训练"挑选材料。给你一篇文章的标题和正文，判断它是否适合作为复述练习卡。
+// 已存在检查（按标题去重）
+function exists(title, link = '') {
+  const cards = db.listCards();
+  if (link) {
+    const normalized = String(link).split('#')[0];
+    if (cards.some((c) => String(c.source || '').includes(normalized))) return true;
+  }
+  return !!cards.find((c) => c.title === title);
+}
+
+// ---------- LLM 筛选、翻译和编辑 ----------
+const prepareSystem = `你是一位中文内容编辑，要把抓取到的文章制作成适合“口头复述训练”的中文卡片。
 
 适合的标准（按优先级）：
-- 语言通俗易懂：现代白话、口语化、普通人一看就懂；**不要**文言文、学术论文、深度技术文章、翻译腔
+- 语言通俗易懂：现代白话、口语化、普通人一看就懂；**不要**文言文、纯学术论文、纯 API 文档、翻译腔
 - 有故事性：完整的小故事、人物经历、生活场景、事件经过，适合讲给别人听
 - 或者是有清晰观点的小短文（观点明确、结构清楚）
+- 技术文章如果能讲清“问题 → 方案 → 结果”，可以入选；不要纯 API 文档或代码堆砌
+- 对技术团队、科研媒体、航天机构的来源，只要文章能提炼出清晰主线就优先通过，不要仅因为术语较多而拒绝
 - 正文长度 300-1500 字
 - 内容独立完整、积极有价值；不是广告、营销软文、纯新闻流水账
 
-输出 JSON：{"pass": true或false, "reason": "一句话理由"}`;
+通过时必须同时完成编辑：
+- 英文标题和正文翻译成自然、准确、没有翻译腔的简体中文；中英混合内容也以中文为主，必要的品牌名、产品名和技术名词可保留英文
+- 删除网址、图片说明、作者/编辑署名、发布时间、版权、订阅/登录/评论提示、“阅读全文”等网页噪声
+- 删除导航、推荐阅读、重复标题以及与文章主线无关的信息，不得添加原文没有的事实
+- 正文整理为 3-6 个短段落，段落之间用两个换行符分隔；结构尽量清晰为“背景或问题 → 主要过程或观点 → 结论或影响”
+- 成品以 500-1200 个中文字为宜；信息不足时宁可简洁，不要编造或用套话凑字数
 
-async function filterCard(title, content) {
-  if (!isConfigured()) return { pass: true, reason: '未配置 LLM，跳过筛选' };
+只输出 JSON：{"pass": true或false, "reason": "一句话理由", "title": "编辑后的中文标题", "content": "清洗翻译并分段后的中文正文"}`;
+
+function sanitizeCardText(text) {
+  const noise = /^(?:read|view) full article|^comments?$|^subscribe|^newsletter|^sign (?:in|up)|^log in|^cookie|^copyright|^all rights reserved|^作者[：:]|^编辑[：:]|^责任编辑[：:]|^图片?(?:来源|说明)[：:]|^点击(?:此处|这里)|^相关阅读[：:]?/i;
+  const seen = new Set();
+  return String(text || '')
+    .replace(/https?:\/\/[^\s）)】\]>]+/gi, '')
+    .replace(/www\.[^\s）)】\]>]+/gi, '')
+    .split(/\n+/)
+    .map((line) => line.replace(/[ \t]+/g, ' ').trim())
+    .filter((line) => line && !noise.test(line))
+    .filter((line) => {
+      const key = line.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .join('\n\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function normalizePublishedDate(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const direct = raw.match(/^(20\d{2})-(\d{2})-(\d{2})/);
+  if (direct) return `${direct[1]}-${direct[2]}-${direct[3]}`;
+  const rfc = raw.match(/^(?:\w{3},\s*)?(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(20\d{2})/i);
+  if (rfc) {
+    const month = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'].indexOf(rfc[2].toLowerCase()) + 1;
+    return `${rfc[3]}-${String(month).padStart(2, '0')}-${String(Number(rfc[1])).padStart(2, '0')}`;
+  }
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) return '';
+  return `${parsed.getUTCFullYear()}-${String(parsed.getUTCMonth() + 1).padStart(2, '0')}-${String(parsed.getUTCDate()).padStart(2, '0')}`;
+}
+
+function publishedDateFromHtml(html, url = '') {
+  const candidates = [
+    html.match(/<meta[^>]+(?:property|name|itemprop)=["'](?:article:published_time|datePublished|parsely-pub-date|publishdate|pubdate)["'][^>]+content=["']([^"']+)/i)?.[1],
+    html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name|itemprop)=["'](?:article:published_time|datePublished|parsely-pub-date|publishdate|pubdate)["']/i)?.[1],
+    html.match(/["']datePublished["']\s*:\s*["']([^"']+)/i)?.[1],
+  ];
+  for (const candidate of candidates) {
+    const date = normalizePublishedDate(candidate);
+    if (date) return date;
+  }
+  const pathDate = String(url).match(/\/(20\d{2})\/(\d{2})\/(\d{2})(?:\/|$)/);
+  return pathDate ? `${pathDate[1]}-${pathDate[2]}-${pathDate[3]}` : '';
+}
+
+async function prepareCard(title, content, source = '') {
+  if (!isConfigured()) {
+    return { pass: true, reason: '未配置 LLM，仅执行本地清洗', title: sanitizeCardText(title), content: sanitizeCardText(content) };
+  }
   const raw = await chat(
-    [{ role: 'system', content: filterSystem }, { role: 'user', content: `标题：${title}\n\n正文：${content.slice(0, 1500)}` }],
+    [{ role: 'system', content: prepareSystem }, { role: 'user', content: `来源：${source}\n标题：${title}\n\n正文：${content.slice(0, 6000)}` }],
     { json: true, temperature: 0 }
   );
   const r = parseJson(raw);
-  return { pass: !!r.pass, reason: String(r.reason || '') };
+  return {
+    pass: !!r.pass,
+    reason: String(r.reason || ''),
+    title: sanitizeCardText(r.title || title),
+    content: sanitizeCardText(r.content || content),
+  };
 }
 
 // ---------- 主流程（可被 server.js 调用） ----------
-async function fetchAndImport({ dryRun = false, maxPerFeed = 5, onLog = () => {} } = {}) {
+async function fetchAndImport({ dryRun = false, maxPerFeed = 5, maxTotal = Number.POSITIVE_INFINITY, onLog = () => {} } = {}) {
   const added = [];
   const skipped = [];
 
   for (const feed of FEEDS) {
+    if (feed.enabled === false) {
+      updateHealth(feed, { status: 'disabled', error: '当前运行环境无法稳定连接，默认停用' });
+      continue;
+    }
+    if (added.length >= maxTotal) break;
     onLog(`▶ 抓取 ${feed.name} …`);
+    const checkedAt = new Date().toISOString();
+    updateHealth(feed, { status: 'checking', lastCheckedAt: checkedAt, error: '' });
     let items;
     try {
-      const res = await fetch(feed.url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' } });
+      const res = await fetch(feed.url, {
+        headers: { 'User-Agent': 'retell-trainer/1.0 (local retelling practice)', Accept: 'application/rss+xml, application/atom+xml, application/xml, text/xml' },
+        signal: AbortSignal.timeout(FEED_TIMEOUT_MS),
+      });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       items = extractItems(await res.text());
     } catch (err) {
+      updateHealth(feed, { status: 'error', error: err.message, lastCheckedAt: checkedAt });
       onLog(`  ✗ 抓取失败：${err.message}`);
       continue;
     }
+    const itemDates = items.map((i) => Date.parse(i.publishedAt)).filter(Number.isFinite);
+    updateHealth(feed, {
+      status: items.length ? 'ok' : 'empty',
+      lastSuccessAt: checkedAt,
+      lastCheckedAt: checkedAt,
+      lastItemAt: itemDates.length ? new Date(Math.max(...itemDates)).toISOString() : null,
+      itemCount: items.length,
+      addedCount: 0,
+      skippedCount: 0,
+      error: '',
+    });
     onLog(`  共 ${items.length} 条，处理前 ${maxPerFeed} 条`);
 
     for (const item of items.slice(0, maxPerFeed)) {
-      if (item.content.length < 300) { skipped.push(`[${feed.name}] 太短：${item.title}`); continue; }
-      if (exists(item.title)) { skipped.push(`[${feed.name}] 已存在：${item.title}`); continue; }
+      if (added.length >= maxTotal) break;
+      let content = item.content || '';
+      if (content.length < (feed.minLength || 300) && feed.fetchArticle !== false && item.link) {
+        try {
+          const article = await fetchArticleText(item.link);
+          if (article.length > content.length) content = article;
+        } catch (err) {
+          onLog(`  ↳ 正文补抓失败：${err.message}`);
+        }
+      }
+      if (content.length < (feed.minLength || 300)) {
+        skipped.push(`[${feed.name}] 太短：${item.title}`);
+        healthFor(feed).skippedCount += 1;
+        continue;
+      }
+      if (exists(item.title, item.link)) {
+        skipped.push(`[${feed.name}] 已存在：${item.title}`);
+        healthFor(feed).skippedCount += 1;
+        continue;
+      }
 
-      let verdict;
+      let prepared;
       try {
-        verdict = await filterCard(item.title, item.content);
+        prepared = await prepareCard(item.title, content, feed.name);
       } catch (err) {
-        onLog(`  ✗ 筛选失败：${err.message}`);
+        onLog(`  ✗ 筛选/翻译失败：${err.message}`);
+        healthFor(feed).skippedCount += 1;
         continue;
       }
-      if (!verdict.pass) {
-        skipped.push(`[${feed.name}] 筛掉：${item.title}（${verdict.reason}）`);
+      if (!prepared.pass) {
+        skipped.push(`[${feed.name}] 筛掉：${item.title}（${prepared.reason}）`);
+        healthFor(feed).skippedCount += 1;
         continue;
       }
 
-      const title = item.title.length > 60 ? item.title.slice(0, 60) + '…' : item.title;
-      const content = item.content.slice(0, 1500);
-      if (!dryRun) db.createCard({ title, content, source: feed.name });
+      const cleanTitle = prepared.title || item.title;
+      const title = cleanTitle.length > 60 ? cleanTitle.slice(0, 60) + '…' : cleanTitle;
+      content = prepared.content.slice(0, 1800).trim();
+      if (content.length < 200) {
+        skipped.push(`[${feed.name}] 编辑后内容太短：${item.title}`);
+        healthFor(feed).skippedCount += 1;
+        continue;
+      }
+      // 将 URL 放入 source，既能在卡片里回看来源，也能避免同一文章重复入库。
+      const source = item.link ? `${feed.name} · ${item.link}` : feed.name;
+      if (!dryRun) db.createCard({ title, content, source, publishedAt: normalizePublishedDate(item.publishedAt) });
       added.push(`[${feed.name}] ${title}（${content.length} 字）`);
+      healthFor(feed).addedCount += 1;
     }
   }
 
-  return { added, skipped };
+  return { added, skipped, feeds: getFeedHealth() };
+}
+
+async function reprocessFeedCards({ onLog = () => {} } = {}) {
+  const feedNames = FEEDS.map((feed) => feed.name);
+  const cards = db.listCards().filter((card) => card.category === 'story'
+    && feedNames.some((name) => String(card.source || '').startsWith(name)));
+  const updated = [];
+  const skipped = [];
+  for (const card of cards) {
+    const sourceName = feedNames.find((name) => String(card.source || '').startsWith(name)) || card.source;
+    try {
+      onLog(`▶ 重新整理《${card.title}》`);
+      const prepared = await prepareCard(card.title, card.content, sourceName);
+      if (!prepared.pass || prepared.content.length < 200) {
+        skipped.push(`${card.title}（${prepared.reason || '编辑后内容太短'}）`);
+        continue;
+      }
+      const title = prepared.title.length > 60 ? `${prepared.title.slice(0, 60)}…` : prepared.title;
+      db.updateCard(card.id, { title, content: prepared.content.slice(0, 1800).trim() });
+      updated.push(title);
+    } catch (err) {
+      skipped.push(`${card.title}（${err.message}）`);
+    }
+  }
+  return { updated, skipped };
 }
 
 // ---------- CLI ----------
@@ -191,7 +437,13 @@ async function fetchTedTranscript(slug, lang = 'zh-cn') {
     .filter(Boolean)
     .join('\n\n'); // TED 官方段落结构，段落间空行
   const langLabel = t.language?.internalLanguageCode || lang;
-  return { slug, text, lang: langLabel, title: ogTitle.replace(/ \| TED(Talk|x)?/i, '').trim() };
+  return {
+    slug,
+    text,
+    lang: langLabel,
+    title: ogTitle.replace(/ \| TED(Talk|x)?/i, '').trim(),
+    publishedAt: publishedDateFromHtml(html, `https://www.ted.com/talks/${slug}`),
+  };
 }
 
 // 按段落把长稿切成若干张复述练习卡（每卡约 400-500 字，接近 1 分钟档）
@@ -237,7 +489,7 @@ async function importTed(urlOrSlug, { lang = 'zh-cn', dryRun = false, onLog = ()
   const skipped = [];
   for (const c of cards) {
     if (exists(c.title)) { skipped.push(`已存在：${c.title}`); continue; }
-    if (!dryRun) db.createCard({ title: c.title, content: c.content, source: `TED ${t.title || t.slug}`, category: 'ted' });
+    if (!dryRun) db.createCard({ title: c.title, content: c.content, source: `TED ${t.title || t.slug}`, category: 'ted', publishedAt: t.publishedAt });
     added.push(`${c.title}（${c.content.length} 字）`);
   }
   return { added, skipped, talkTitle: t.title || t.slug, lang: t.lang };
@@ -333,7 +585,8 @@ async function importRmrb({ dryRun = false, onLog = () => {} } = {}) {
       if (exists(title)) { skipped.push(`已存在：${title}`); continue; }
       const t = title.length > 50 ? title.slice(0, 50) + '…' : title;
       // 完整评论一张卡，不按时长切分
-      if (!dryRun) db.createCard({ title: t, content, source: `人民日报 ${found.ymd} 评论版`, category: 'rmrb' });
+      const publishedAt = `${found.ymd.slice(0, 4)}-${found.ymd.slice(4, 6)}-${found.ymd.slice(-2)}`;
+      if (!dryRun) db.createCard({ title: t, content, source: `人民日报 ${found.ymd} 评论版`, category: 'rmrb', publishedAt });
       added.push(`${t}（${content.length} 字）`);
     } catch (err) {
       skipped.push(`抓取失败：${url.split('/').pop()}（${err.message}）`);
@@ -393,7 +646,7 @@ async function importDailyShort({ dryRun = false, onLog = () => {} } = {}) {
       if (!title || content.length < SHORT_MIN) { skipped.push(`太短/无题：${title || url.slice(-28)}`); continue; }
       if (content.length > SHORT_MAX) { skipped.push(`超长短评：${title.slice(0, 24)}（${content.length}字）`); continue; }
       if (exists(title)) { skipped.push(`已存在：${title.slice(0, 24)}`); continue; }
-      if (!dryRun) db.createCard({ title, content, source: `人民网观点频道·${column} ${url.slice(url.indexOf('n1/') + 3, url.indexOf('n1/') + 13)}`, category: 'short' });
+      if (!dryRun) db.createCard({ title, content, source: `人民网观点频道·${column} ${url.slice(url.indexOf('n1/') + 3, url.indexOf('n1/') + 13)}`, category: 'short', publishedAt: dm ? `${dm[1]}-${dm[2]}-${dm[3]}` : '' });
       added.push(`${title.slice(0, 28)}（${content.length} 字）`);
     } catch (err) {
       skipped.push(`抓取失败：${url.slice(-26)}（${err.message}）`);
@@ -406,8 +659,10 @@ async function importDailyShort({ dryRun = false, onLog = () => {} } = {}) {
 /** 粘贴/URL 导入短评：{url} 自动提取标题正文，或 {title, content}（content 可为全文或正文）直接存卡 */
 async function importShort({ url = '', title = '', content = '', source = '', onLog = () => {} } = {}) {
   let final = { title, content, source };
+  let publishedAt = '';
   if (url) {
     const html = await fetchHtml(url);
+    publishedAt = publishedDateFromHtml(html, url);
     const ex = extractPeopleComment(html); // 人民网模板提取
     if (ex.content.length < 100) {
       // 通用兜底：body 段落提取（含噪声过滤：链接/邮箱/版权/许可证行）
@@ -424,9 +679,9 @@ async function importShort({ url = '', title = '', content = '', source = '', on
   const body = String(final.content || '').trim();
   if (body.length < 50) throw new Error('正文太短，无法保存');
   if (exists(final.title)) throw new Error(`《${final.title}》已在素材库中`);
-  db.createCard({ title: final.title || '未命名短评', content: body, source: final.source || '手动导入', category: 'short' });
+  db.createCard({ title: final.title || '未命名短评', content: body, source: final.source || '手动导入', category: 'short', publishedAt });
   onLog(`已保存《${final.title}》（${body.length} 字）`);
   return { title: final.title, len: body.length };
 }
 
-module.exports = { fetchAndImport, FEEDS, importTed, tedSlugFromUrl, importRmrb, extractRmrbBody, importDailyShort, importShort };
+module.exports = { fetchAndImport, reprocessFeedCards, FEEDS, getFeedHealth, extractItems, sanitizeCardText, normalizePublishedDate, publishedDateFromHtml, importTed, tedSlugFromUrl, importRmrb, extractRmrbBody, importDailyShort, importShort };
