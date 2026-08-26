@@ -10,12 +10,27 @@ jobs:
     name: SSH 部署到 VPS
     runs-on: ubuntu-latest
     steps:
-      - name: 通过 SSH 执行部署脚本
+      - name: 通过 SSH 执行部署
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: 129.204.188.81
           username: root
           port: 22
           key: ${{ secrets.DEPLOY_SSH_KEY }}
-          timeout: 120s
-          script: bash /home/Shawn/project/retell-trainer/deploy.sh
+          timeout: 180s
+          script: |
+            set -e
+            cd /home/Shawn/project/retell-trainer
+            echo "== git pull =="
+            git pull --ff-only origin main
+            if git diff --quiet HEAD~1 HEAD -- package.json package-lock.json; then
+              echo "== 依赖无变化，跳过 npm install =="
+            else
+              echo "== npm install =="
+              npm install --no-audit --no-fund --loglevel=error
+            fi
+            echo "== restart =="
+            systemctl restart retell-trainer
+            sleep 2
+            systemctl is-active retell-trainer
+            git log --oneline -1
