@@ -138,8 +138,9 @@ app.post('/api/practice/transcribe',
       try {
         const asr = await pyRun(ASR_SCRIPT, audioPath, 10 * 60 * 1000);
         if (!asr.ok) return res.status(502).json({ error: asr.error || '语音转写失败' });
-        const text = await formatTranscript(cleanTranscript(asr.text));
-        res.json({ text });
+        const fmtInfo = {};
+        const text = await formatTranscript(cleanTranscript(asr.text), fmtInfo);
+        res.json({ text, formatted: Boolean(fmtInfo.ok) });
       } finally {
         try { fs.unlinkSync(audioPath); } catch { /* */ }
       }
@@ -721,7 +722,9 @@ async function runLinkTask(task, url) {
       task.step = 'transcribe';
       const asr = await pyRun(ASR_SCRIPT, audioPath, 30 * 60 * 1000);
       if (!asr.ok) return fail(task, asr.error || '语音转写失败');
-      task.text = await formatTranscript(cleanTranscript(asr.text));
+      const fmtInfo = {};
+      task.text = await formatTranscript(cleanTranscript(asr.text), fmtInfo);
+      task.fmt = fmtInfo.ok ? 'ai' : ('raw:' + (fmtInfo.skip || 'unknown'));
       task.status = 'done';
     } else if (/xiaohongshu|xhslink/i.test(url)) {
       task.step = 'fetch';
@@ -749,10 +752,14 @@ function cleanTranscript(t) {
   return String(t || '').replace(/\r\n?/g, '\n').replace(/[ \t\u3000]+/g, ' ').trim();
 }
 
-// 转写稿格式化：LLM 补标点、分段；失败静默回退原文，绝不因此让任务失败
-async function formatTranscript(raw) {
+// 转写稿格式化：LLM 补标点、分段；失败静默回退原文，绝不因此让任务失败。
+// info 参数回传诊断信息（info.ok = 是否经 AI 格式化；info.skip = 回退原因）
+async function formatTranscript(raw, info) {
   const text = String(raw || '').trim();
-  if (!text || !isConfigured()) return text;
+  if (!text || !isConfigured()) {
+    if (info) { info.ok = false; info.skip = !text ? '空' : 'LLM 未配置'; }
+    return text;
+  }
   try {
     const out = await chat(
       [{ role: 'system', content: prompts.transcriptFormatSystem(text.slice(0, 6000)) }],
@@ -760,10 +767,15 @@ async function formatTranscript(raw) {
     );
     const cleaned = String(out || '').replace(/^["'「『]+|["'」』]+$/g, '').trim();
     // 合理性检查：输出不能比原文缩水太多（防止模型偷懒概括）
-    if (cleaned.length >= Math.max(text.length * 0.5, 20)) return cleaned;
+    if (cleaned.length >= Math.max(text.length * 0.5, 20)) {
+      if (info) info.ok = true;
+      return cleaned;
+    }
     console.error(`[转写格式化] 输出过短(${text.length} -> ${cleaned.length})，回退原文`);
+    if (info) { info.ok = false; info.skip = `AI 输出过短 ${cleaned.length}/${text.length}`; }
   } catch (err) {
     console.error('[转写格式化]', err.message);
+    if (info) { info.ok = false; info.skip = String(err.message || err).slice(0, 120); }
   }
   return text;
 }
@@ -808,9 +820,10 @@ app.post('/api/material/link', (req, res) => {
   if (!LINK_ALLOWED_HOSTS.includes(host)) {
     return res.status(400).json({ error: '目前支持抖音（douyin.com）和小红书（xiaohongshu.com）的分享链接' });
   }
-  // 简单去重：同一 URL 进行中/完成的任务直接复用（读取最近 10 个）
+  // 简单去重：同一 URL 已成功(done)的任务直接复用；failed 不复用，让用户重新粘贴即可重试
+  //（抖音解析偶发抽风，永久缓存失败会导致没法重试）
   for (const t of linkTasks.values()) {
-    if (t.url === url && (t.status === 'done' || t.status === 'failed')) {
+    if (t.url === url && t.status === 'done') {
       return res.json({ taskId: t.id, cached: true });
     }
   }
@@ -829,6 +842,7 @@ app.get('/api/material/link/:id', (req, res) => {
     meta: task.status === 'done' ? task.meta : null,
     text: task.status === 'done' ? task.text : '',
     error: task.error || '', cached: Boolean(task.cached),
+    fmt: task.fmt || (task.status === 'done' ? 'ai' : ''),
   });
 });
 
