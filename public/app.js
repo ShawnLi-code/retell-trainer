@@ -190,7 +190,7 @@ const LINK_IMPORT_HTML = `
       <div id="link-status"></div>
     </div>`;
 
-function bindLinkImport(root) {
+function bindLinkImport(root, onSaved) {
   const urlInput = $('#link-url');
   const goBtn = $('#link-go');
   const statusEl = $('#link-status');
@@ -225,8 +225,9 @@ function bindLinkImport(root) {
           try {
             await api.post(`/api/material/link/${taskId}/save`, {});
             savedOk = true;
-            toast('已存入素材库，去「素材」页或首页选「订阅素材复述」就能练');
-            setTimeout(() => { if (urlInput) urlInput.value = ''; }, 200);
+            toast('已存入素材库，就在「素材库 → 短视频解析」页里');
+            if (onSaved) setTimeout(onSaved, 600);
+            else setTimeout(() => { if (urlInput) urlInput.value = ''; }, 200);
           } catch (err) { toast('存入失败：' + err.message); saveBtn.disabled = false; saveBtn.textContent = '📥 存入素材库'; }
         });
         return; // 停止轮询
@@ -597,14 +598,14 @@ async function cards(root, sub = 'ted') {
     root.innerHTML = `<div class="empty">${esc(err.message)}</div>`;
     return;
   }
-  const cat = ['ted', 'rmrb', 'short', 'story'].includes(sub) ? sub : 'ted';
+  const cat = ['ted', 'rmrb', 'short', 'story', 'video'].includes(sub) ? sub : 'ted';
   const items = list.filter((c) => c.category === cat);
-  const catMeta = CATS[cat];
+  const catMeta = CATS[cat] || { name: '短视频解析' };
   const tabs = [
     ['ted', 'TED 演讲'],
     ['rmrb', '人民日报'],
     ['short', '每日短评'],
-  ].concat([['story', '订阅素材']]).map(([k, name]) => `<a href="#/cards${k === 'ted' ? '' : '/' + k}" class="${cat === k ? 'active' : ''}">${name}</a>`).join('');
+  ].concat([['story', '订阅素材'], ['video', '短视频解析']]).map(([k, name]) => `<a href="#/cards${k === 'ted' ? '' : '/' + k}" class="${cat === k ? 'active' : ''}">${name}</a>`).join('');
 
   root.innerHTML = `
     <div class="view-tabs">${tabs}</div>
@@ -628,15 +629,16 @@ async function cards(root, sub = 'ted') {
         <input id="short-title" placeholder="标题（直接贴正文时填写）">
         <textarea id="short-content" placeholder="或直接粘贴短评正文（300 字以上）"></textarea>
         <button id="short-import" class="ghost">${iconBtn(ICONS.plus, '保存为短评素材')}</button>
-      </div>` : `
+      </div>` : cat === 'story' ? `
       <div class="gen-row">
         <span class="dim">每日自动抓取公开 RSS/Atom（AI 自动翻译英文、过滤网页噪声并整理中文段落）</span>
         <button id="rss-btn" class="ghost">${iconBtn(ICONS.refresh, '立即抓取订阅源')}</button>
         <button id="rss-reprocess-btn" class="ghost">整理已有素材</button>
         <button id="rss-health-btn" class="ghost">查看来源状态</button>
       </div>
-      <div id="rss-health" class="dim hidden"></div>`}
-    ${LINK_IMPORT_HTML}
+      <div id="rss-health" class="dim hidden"></div>` : `
+      ${LINK_IMPORT_HTML}
+      <p class="dim">解析成功的文字稿就存在本页列表里，点「直接练」即可开始复述。</p>`}
     <ul class="card-list">
       ${items.map((c) => `
         <li class="card-row">
@@ -645,7 +647,7 @@ async function cards(root, sub = 'ted') {
             <span class="dim">${materialDate(c.published_at)} · ${c.content.length} 字${lenBadge(c.content.length)} · ${sourceHtml(c.source)}${c.used_at ? ' · 练过' : ' · 未练'}</span>
           </div>
           <button class="practice-btn" data-id="${c.id}">直接练</button>
-        </li>`).join('') || `<li class="dim">「${esc(catMeta.name)}」还没有素材${cat === 'rmrb' ? '，点上面按钮抓取今日评论' : cat === 'short' ? '，点上面按钮抓取每日短评' : cat === 'story' ? '，点上面按钮立即抓取订阅源' : '，粘贴一个 TED 演讲链接导入'}</li>`}
+        </li>`).join('') || `<li class="dim">「${esc(catMeta.name)}」还没有素材${cat === 'rmrb' ? '，点上面按钮抓取今日评论' : cat === 'short' ? '，点上面按钮抓取每日短评' : cat === 'story' ? '，点上面按钮立即抓取订阅源' : cat === 'video' ? '，把抖音/小红书分享文案粘到上面，点「解析」' : '，粘贴一个 TED 演讲链接导入'}</li>`}
     </ul>`;
 
   const btn = cat === 'ted' ? $('#ted-btn') : cat === 'rmrb' ? $('#rmrb-btn') : cat === 'short' ? $('#short-btn') : $('#rss-btn');
@@ -682,7 +684,7 @@ async function cards(root, sub = 'ted') {
     });
   }
 
-  bindLinkImport(root);
+  bindLinkImport(root, () => cards(root, cat));
 
   if (cat === 'story') {
     const reprocessBtn = $('#rss-reprocess-btn');

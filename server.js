@@ -106,7 +106,7 @@ app.post('/api/cards', (req, res) => {
 // ---------- 练习选卡：板块 -> 完整素材（短素材优先，适配复述） ----------
 app.post('/api/practice/pick', (req, res) => {
   const category = String((req.body || {}).category || '');
-  if (!['ted', 'rmrb', 'short', 'story'].includes(category)) return res.status(400).json({ error: '板块必须是 ted / rmrb / short / story' });
+  if (!['ted', 'rmrb', 'short', 'story', 'video'].includes(category)) return res.status(400).json({ error: '板块必须是 ted / rmrb / short / story / video' });
 
   const all = db.listCardsByCategory(category);
   if (!all.length) return res.status(404).json({ error: '该板块还没有素材，先去素材库导入' });
@@ -789,8 +789,10 @@ app.post('/api/material/link/:id/save', (req, res) => {
   if (text.length < 30) return res.status(400).json({ error: '转写内容太短，不适合做素材' });
   const meta = task.meta || {};
   const title = cleanTitle(String((req.body || {}).title || '').trim() || titleFromDesc(meta.desc || meta.title || ''));
-  const id = db.createCard({ title, content: text, source: '抖音' + (meta.author ? '@' + meta.author : ''), category: 'story' });
-  res.json({ id, title });
+  // 平台标识：解析器标了 platform 用它的；否则按任务 URL 判断（抖音 / 小红书）
+  const plat = meta.platform || (/xiaohongshu|xhslink/i.test(task.url || '') ? '小红书' : '抖音');
+  const id = db.createCard({ title, content: text, source: plat + (meta.author ? '@' + meta.author : ''), category: 'video' });
+  res.json({ id, title, category: 'video' });
 });
 app.listen(PORT, () => {
   console.log(`复述训练场已启动：http://localhost:${PORT}`);
