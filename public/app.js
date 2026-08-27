@@ -223,9 +223,12 @@ async function renderLinkTasks(root) {
     if (t.status === 'done') statusLine = `✅ 完成${t.meta && t.meta.author ? ' · @' + esc(t.meta.author) : ''}`;
     else if (t.status === 'failed') statusLine = `❌ ${esc(t.error || '解析失败')}`;
     else statusLine = `⏳ ${STEP_LABEL[t.step] || '处理中'} · ${t.pct || 0}%`;
+    const rawFmt = t.fmt && !t.fmt.startsWith('ai') && t.fmt !== 'meta';
     const action = t.status === 'done'
       ? (t.saved
-        ? '<span class="dim">已存入素材库 ✅</span>'
+        ? (rawFmt
+          ? `<button class="ghost lt-fix" data-id="${t.id}">✨ AI 整理格式</button> <span class="dim">当初 AI 整理没成功，点此补救</span>`
+          : '<span class="dim">已存入素材库 ✅</span>')
         : `<button class="primary lt-save" data-id="${t.id}">📥 存入素材库</button>`)
       : (t.status === 'failed' ? '<span class="dim">重新粘贴链接即可重试</span>' : '');
     return `
@@ -248,6 +251,21 @@ async function renderLinkTasks(root) {
         toast('存入失败：' + err.message);
         btn.disabled = false;
         btn.textContent = '📥 存入素材库';
+      }
+    });
+  });
+  box.querySelectorAll('.lt-fix').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      btn.textContent = 'AI 整理中…（最长约 3 分钟）';
+      try {
+        const r = await api.post(`/api/material/link/${btn.dataset.id}/reformat`, {});
+        toast(`整理完成，共 ${r.length} 字，去「直接练」试试`);
+        renderLinkTasks(root);
+      } catch (err) {
+        toast(err.message);
+        btn.disabled = false;
+        btn.textContent = '✨ AI 整理格式';
       }
     });
   });

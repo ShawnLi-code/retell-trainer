@@ -653,7 +653,10 @@ function classifyPlatform(url) {
   return '网页';
 }
 function updTask(id, patch) {
-  if (patch.step !== undefined && patch.pct === undefined) patch.pct = taskPct(patch.step, patch.status);
+  if (patch.pct === undefined) {
+    if (patch.status === 'done' || patch.status === 'failed') patch.pct = 100;
+    else if (patch.step !== undefined) patch.pct = taskPct(patch.step, patch.status);
+  }
   db.updateLinkTask(id, patch);
 }
 
@@ -917,6 +920,21 @@ app.post('/api/material/link/:id/save', async (req, res) => {
   const id = db.createCard({ title, content: text, source: (meta.platform || task.host || '网页') + (meta.author ? '@' + meta.author : ''), category: 'video' });
   db.updateLinkTask(task.id, { saved: 1, card_id: id });
   res.json({ id, title, category: 'video' });
+});
+
+// 补救：已入库但当年 AI 格式化失败的素材（LLM 瞬时故障），手动触发一次 AI 整理
+app.post('/api/material/link/:id/reformat', async (req, res) => {
+  const task = db.getLinkTask(req.params.id);
+  if (!task || task.status !== 'done') return res.status(400).json({ error: '任务未完成' });
+  if (!task.saved || !task.card_id) return res.status(400).json({ error: '这条还没存入素材库' });
+  const card = db.getCard(task.card_id);
+  if (!card) return res.status(404).json({ error: '素材卡不存在了' });
+  const fmtInfo = {};
+  const better = await formatTranscript(String(card.content || ''), fmtInfo);
+  if (!fmtInfo.ok) return res.status(502).json({ error: 'AI 整理没成功：' + (fmtInfo.skip || '未知原因') + '，稍后再试' });
+  db.updateCard(task.card_id, { content: better });
+  db.updateLinkTask(task.id, { fmt: 'ai', text: better });
+  res.json({ id: task.card_id, length: better.length });
 });
 app.listen(PORT, () => {
   console.log(`复述训练场已启动：http://localhost:${PORT}`);
