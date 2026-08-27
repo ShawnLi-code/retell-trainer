@@ -48,7 +48,7 @@ npm start
 - 提示词全部在 `prompts.js`，改这里不动代码
 - 追问轮数上限在 `server.js` 的 `MAX_TURNS`
 
-## �Զ�����
+## 自动部署
 
-push �� main ��֧�󣬷��������� 1 ������ͨ�� GitHub Webhook �Զ���ȡ���������������ֶ���������
+push 到 main 分支后，服务器会在 1 分钟内通过 GitHub Webhook 自动拉取并重启服务（无需手动操作）。
 
