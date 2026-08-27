@@ -847,11 +847,21 @@ app.get('/api/material/link/:id', (req, res) => {
 });
 
 // 转写结果存入素材库（复述素材）
-app.post('/api/material/link/:id/save', (req, res) => {
+app.post('/api/material/link/:id/save', async (req, res) => {
   const task = linkTasks.get(req.params.id);
   if (!task || task.status !== 'done') return res.status(400).json({ error: '任务还没有完成' });
-  const text = String(task.text || '').trim();
+  let text = String(task.text || '').trim();
   if (text.length < 30) return res.status(400).json({ error: '转写内容太短，不适合做素材' });
+  // 自愈：入库前若当初没完成 AI 格式化（LLM 瞬时超时等），当场补一次
+  if (task.fmt !== 'ai' && text.length >= 200) {
+    const fmtInfo = {};
+    const better = await formatTranscript(text, fmtInfo);
+    if (fmtInfo.ok) {
+      task.text = better;
+      task.fmt = 'ai';
+      text = better;
+    }
+  }
   const meta = task.meta || {};
   const title = cleanTitle(String((req.body || {}).title || '').trim() || titleFromDesc(meta.desc || meta.title || ''));
   // 平台标识：解析器标了 platform 用它的；否则按任务 URL 判断（抖音 / 小红书）
