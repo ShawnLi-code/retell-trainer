@@ -636,11 +636,26 @@ const ASR_SCRIPT = process.env.ASR_SCRIPT || (process.platform === 'win32'
   ? path.join(__dirname, '..', 'tools', 'dy-api', 'asr.py')
   : '/root/asr.py');
 const DY_CACHE_DIR = process.env.DY_CACHE_DIR || '/opt/dy-cache';
-const LINK_ALLOWED_HOSTS = ['v.douyin.com', 'www.douyin.com', 'douyin.com', 'iesdouyin.com', 'xhslink.com', 'www.xiaohongshu.com', 'xiaohongshu.com'];
+const LINK_ALLOWED_HOSTS = ['v.douyin.com', 'www.douyin.com', 'douyin.com', 'iesdouyin.com', 'xhslink.com', 'xhslink.cn', 'www.xiaohongshu.com', 'xiaohongshu.com'];
 
-const linkTasks = new Map(); // id -> {status, meta, text, error, created, step}
-const linkQueue = [];
+const UA_DESKTOP = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
+const linkQueue = []; // 待处理任务 {id,url}；任务本体持久化在 SQLite（重启不丢，列表实时可见）
 let linkRunning = false;
+
+const STEP_PCT = { '': 5, fetch: 20, audio: 50, transcribe: 75, format: 92 };
+function taskPct(step, status) {
+  if (status === 'done' || status === 'failed') return 100;
+  return STEP_PCT[step] || 5;
+}
+function classifyPlatform(url) {
+  if (/douyin|iesdouyin/i.test(url)) return '抖音';
+  if (/xhslink|xiaohongshu/i.test(url)) return '小红书';
+  return '网页';
+}
+function updTask(id, patch) {
+  if (patch.step !== undefined && patch.pct === undefined) patch.pct = taskPct(patch.step, patch.status);
+  db.updateLinkTask(id, patch);
+}
 
 function pyRun(script, arg, timeoutMs = 150000) {
   return new Promise((resolve) => {
@@ -696,54 +711,91 @@ function stripSuffix(t) {
   return t.replace(/[，。！？、：；\s]+$/g, '').trim();
 }
 
-async function runLinkTask(task, url) {
+// 小红书笔记页解析：视频笔记的 og:video 直接给 MP4 直链（无需登录），标题/文案在 og: meta 里
+async function parseXhsPage(url) {
+  const res = await fetch(url, { redirect: 'follow', headers: { 'User-Agent': UA_DESKTOP }, signal: AbortSignal.timeout(30000) });
+  if (!res.ok) return { ok: false, error: `小红书页面返回 ${res.status}` };
+  const html = await res.text();
+  const decode = (s) => s.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, ' ');
+  const metaOf = (name) => {
+    const m = html.match(new RegExp(`<meta[^>]*(?:property|name)=["']${name}["'][^>]*content=["']([^"']*)["']`, 'i'))
+      || html.match(new RegExp(`<meta[^>]*content=["']([^"']*)["'][^>]*(?:property|name)=["']${name}["']`, 'i'));
+    return m ? decode(m[1]) : '';
+  };
+  let videoUrl = metaOf('og:video');
+  if (!videoUrl) {
+    const mv = html.match(/"masterUrl"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+    if (mv) { try { videoUrl = JSON.parse('"' + mv[1] + '"'); } catch { videoUrl = mv[1].replace(/\\u002F/gi, '/'); } }
+  }
+  const title = cleanTitle(metaOf('og:title').replace(/\s*[-|]\s*小红书\s*$/, ''));
+  const desc = metaOf('og:description');
+  if (!title && !desc && !videoUrl) return { ok: false, error: '这个笔记没能提取到内容（可能需要登录，或链接已失效）' };
+  const noteId = (String(res.url).match(/\/(?:discovery|explore)\/([0-9a-f]{16,32})/i) || [])[1] || '';
+  return { ok: true, title, desc, videoUrl, noteId, finalUrl: res.url };
+}
+
+async function downloadMedia(url, savePath, timeoutMs = 300000) {
+  const res = await fetch(url, { headers: { 'User-Agent': UA_DESKTOP, Referer: 'https://www.xiaohongshu.com/' }, signal: AbortSignal.timeout(timeoutMs) });
+  if (!res.ok) throw new Error('下载失败（HTTP ' + res.status + '）');
+  const buf = Buffer.from(await res.arrayBuffer());
+  fs.writeFileSync(savePath, buf);
+  return buf.length;
+}
+
+// 统一的"转写 → AI 格式化 → done"收尾；抛错由上层兜底记为失败
+async function transcribeToTask(taskId, audioPath) {
+  updTask(taskId, { status: 'running', step: 'transcribe' });
+  const asr = await pyRun(ASR_SCRIPT, audioPath, 30 * 60 * 1000);
+  if (!asr.ok) throw new Error(asr.error || '语音转写失败');
+  updTask(taskId, { step: 'format' });
+  const fmtInfo = {};
+  const text = await formatTranscript(cleanTranscript(asr.text), fmtInfo);
+  updTask(taskId, { text, fmt: fmtInfo.ok ? 'ai' : ('raw:' + (fmtInfo.skip || 'unknown')), status: 'done' });
+}
+
+async function runLinkTask(taskId, url) {
+  const plat = classifyPlatform(url);
   try {
-    task.status = 'running';
-    // 1) 解析元数据
-    if (/douyin|iesdouyin/i.test(url) || /(^|\/)(share\/)?video\/\d{15,}/i.test(url) || /v\.douyin\.com/i.test(url)) {
-      task.step = 'fetch';
+    updTask(taskId, { status: 'running', step: 'fetch' });
+    if (plat === '抖音') {
       const meta = await pyRun(DY_PARSE_SCRIPT, url, 120000);
-      if (!meta.ok) return fail(task, meta.error || '抖音解析失败');
-      task.meta = meta;
-      // 有的视频无音乐/音频源则回退视频流
-      if (!meta.music_url && !meta.video_url) return fail(task, '没有找到音频/视频地址');
-      // 2) 下载音频
-      task.step = 'audio';
-      const audioUrl = meta.music_url || meta.video_url;
-      fs.mkdirSync(DY_CACHE_DIR, { recursive: true });
+      if (!meta.ok) throw new Error(meta.error || '抖音解析失败');
+      meta.platform = '抖音';
+      if (!meta.music_url && !meta.video_url) throw new Error('没有找到音频/视频地址');
+      updTask(taskId, { meta });
       const audioPath = path.join(DY_CACHE_DIR, meta.id + '.mp3');
       if (!fs.existsSync(audioPath)) {
-        const res = await fetch(audioUrl, { signal: AbortSignal.timeout(180000) });
-        if (!res.ok) return fail(task, '音频下载失败（HTTP ' + res.status + '）');
-        const buf = Buffer.from(await res.arrayBuffer());
-        fs.writeFileSync(audioPath, buf);
+        updTask(taskId, { step: 'audio' });
+        await downloadMedia(meta.music_url || meta.video_url, audioPath, 180000);
       }
-      // 3) ASR 转写
-      task.step = 'transcribe';
-      const asr = await pyRun(ASR_SCRIPT, audioPath, 30 * 60 * 1000);
-      if (!asr.ok) return fail(task, asr.error || '语音转写失败');
-      const fmtInfo = {};
-      task.text = await formatTranscript(cleanTranscript(asr.text), fmtInfo);
-      task.fmt = fmtInfo.ok ? 'ai' : ('raw:' + (fmtInfo.skip || 'unknown'));
-      task.status = 'done';
-    } else if (/xiaohongshu|xhslink/i.test(url)) {
-      task.step = 'fetch';
-      const page = await parseWebPage(url);
-      if (!page.ok) return fail(task, page.error);
-      task.meta = { desc: page.desc || '', title: page.title };
-      task.text = cleanTranscript(page.desc);
-      task.status = 'done';
+      await transcribeToTask(taskId, audioPath);
+    } else if (plat === '小红书') {
+      const page = await parseXhsPage(url);
+      if (!page.ok) throw new Error(page.error);
+      const meta = { title: page.title, desc: page.desc, platform: '小红书', finalUrl: page.finalUrl };
+      updTask(taskId, { meta });
+      if (page.videoUrl) {
+        // 视频笔记：下载 MP4 → Whisper 转写文字稿
+        const mediaPath = path.join(DY_CACHE_DIR, 'xhs-' + (page.noteId || randomUUID().slice(0, 8)) + '.mp4');
+        if (!fs.existsSync(mediaPath)) {
+          updTask(taskId, { step: 'audio' });
+          await downloadMedia(page.videoUrl, mediaPath);
+        }
+        await transcribeToTask(taskId, mediaPath);
+      } else {
+        // 图文笔记：没有视频可转，直接拿标题+文案做素材
+        updTask(taskId, { step: 'format' });
+        const text = [page.title, page.desc].filter(Boolean).join('\n').trim();
+        updTask(taskId, { text: text || '（未能提取到内容）', fmt: 'meta', status: 'done' });
+      }
     } else {
-      // 其他：尝试通用网页元数据
-      task.step = 'fetch';
+      // 其他网页：退化为元数据文案
       const page = await parseWebPage(url);
-      if (!page.ok) return fail(task, page.error);
-      task.meta = { desc: page.desc || '', title: page.title || '网页' };
-      task.text = cleanTranscript(page.desc);
-      task.status = 'done';
+      if (!page.ok) throw new Error(page.error);
+      updTask(taskId, { meta: { title: page.title, desc: page.desc, platform: '网页' }, text: cleanTranscript(page.desc), fmt: 'meta', status: 'done' });
     }
   } catch (err) {
-    fail(task, String(err.message || err));
+    updTask(taskId, { status: 'failed', error: String(err.message || err).slice(0, 200) });
   }
 }
 
@@ -780,23 +832,12 @@ async function formatTranscript(raw, info) {
   return text;
 }
 
-function fail(task, error) {
-  task.status = 'failed';
-  task.error = error;
-  saveTask(task);
-}
-
-function saveTask(task) {
-  try { fs.writeFileSync(path.join('/tmp', 'link-task-' + task.id + '.json'), JSON.stringify(task)); } catch { /* 忽略 */ }
-}
-
 function pumpLinkQueue() {
   if (linkRunning) return;
-  const task = linkQueue.shift();
-  if (!task) { linkRunning = false; return; }
+  const job = linkQueue.shift();
+  if (!job) { linkRunning = false; return; }
   linkRunning = true;
-  runLinkTask(task, task.url).finally(() => {
-    saveTask(task);
+  runLinkTask(job.id, job.url).finally(() => {
     linkRunning = false;
     pumpLinkQueue();
   });
@@ -807,8 +848,8 @@ function pumpLinkQueue() {
 function extractShareUrl(raw) {
   let m = raw.match(/https?:\/\/[^\s'"<>，。《》【】（）()]+/i);
   if (m) return m[0].replace(/[.,;:!?，。；：！？）】"'’”]+$/, '');
-  // 没写协议的裸短链（v.douyin.com/xxx），自动补上 https://
-  m = raw.match(/(?:v\.douyin\.com|xhslink\.com)\/[A-Za-z0-9_-]+\/?/i);
+  // 没写协议的裸短链（v.douyin.com/xxx、xhslink.cn/xxx），自动补上 https://
+  m = raw.match(/(?:v\.douyin\.com|xhslink\.(?:com|cn))\/[A-Za-z0-9_-]+\/?/i);
   return m ? 'https://' + m[0].replace(/[.,;:!?，。；：！？）】"'’”]+$/, '') : '';
 }
 
@@ -816,40 +857,50 @@ app.post('/api/material/link', (req, res) => {
   const raw = String((req.body || {}).url || '').trim();
   const url = extractShareUrl(raw) || raw;
   let host;
-  try { host = new URL(url).hostname.replace(/^www\./, ''); } catch { return res.status(400).json({ error: '没找到有效链接——抖音/小红书分享的整段文案可以直接粘贴（内含 v.douyin.com 或 xhslink.com 链接即可）' }); }
+  try { host = new URL(url).hostname.replace(/^www\./, ''); } catch { return res.status(400).json({ error: '没找到有效链接——抖音/小红书分享的整段文案可以直接粘贴（内含 v.douyin.com 或 xhslink 链接即可）' }); }
   if (!LINK_ALLOWED_HOSTS.includes(host)) {
-    return res.status(400).json({ error: '目前支持抖音（douyin.com）和小红书（xiaohongshu.com）的分享链接' });
+    return res.status(400).json({ error: '目前支持抖音和小红书的分享链接（v.douyin.com / xhslink.cn / xiaohongshu.com）' });
   }
-  // 简单去重：同一 URL 已成功(done)的任务直接复用；failed 不复用，让用户重新粘贴即可重试
-  //（抖音解析偶发抽风，永久缓存失败会导致没法重试）
-  for (const t of linkTasks.values()) {
-    if (t.url === url && t.status === 'done') {
-      return res.json({ taskId: t.id, cached: true });
-    }
-  }
-  const task = { id: randomUUID().slice(0, 8), url: url, status: 'queued', step: '', meta: null, text: '', error: '', created: Date.now() };
-  linkTasks.set(task.id, task);
+  const cachedId = db.findDoneTaskByUrl(url);
+  if (cachedId) return res.json({ taskId: cachedId, cached: true });
+  const task = { id: randomUUID().slice(0, 8), url, host: classifyPlatform(url) };
+  db.createLinkTask(task);
   linkQueue.push(task);
   pumpLinkQueue();
   res.json({ taskId: task.id });
 });
 
-app.get('/api/material/link/:id', (req, res) => {
-  const task = linkTasks.get(req.params.id);
-  if (!task) return res.status(404).json({ error: '任务不存在' });
+// 任务列表（持久化）：前端"短视频解析"页实时渲染进度条
+app.get('/api/material/link/tasks', (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 20, 50);
   res.json({
-    id: task.id, status: task.status, step: task.step,
-    meta: task.status === 'done' ? task.meta : null,
-    text: task.status === 'done' ? task.text : '',
-    error: task.error || '', cached: Boolean(task.cached),
-    fmt: task.fmt || (task.status === 'done' ? 'ai' : ''),
+    tasks: db.listLinkTasks(limit).map((t) => ({
+      id: t.id, url: t.url, host: t.host, status: t.status, step: t.step, pct: t.pct,
+      error: t.error, fmt: t.fmt, saved: Boolean(t.saved), created_at: t.created_at,
+      meta: t.meta ? { title: t.meta.title, desc: t.meta.desc, author: t.meta.author, platform: t.meta.platform } : null,
+    })),
+  });
+});
+
+app.get('/api/material/link/:id', (req, res) => {
+  const t = db.getLinkTask(req.params.id);
+  if (!t) return res.status(404).json({ error: '任务不存在' });
+  res.json({
+    id: t.id, url: t.url, host: t.host, status: t.status, step: t.step, pct: t.pct,
+    meta: t.status === 'done' ? t.meta : null,
+    text: t.status === 'done' ? t.text : '',
+    error: t.error || '', saved: Boolean(t.saved),
+    fmt: t.fmt || (t.status === 'done' ? 'ai' : ''),
+    created_at: t.created_at,
   });
 });
 
 // 转写结果存入素材库（复述素材）
 app.post('/api/material/link/:id/save', async (req, res) => {
-  const task = linkTasks.get(req.params.id);
-  if (!task || task.status !== 'done') return res.status(400).json({ error: '任务还没有完成' });
+  const task = db.getLinkTask(req.params.id);
+  if (!task) return res.status(404).json({ error: '任务不存在' });
+  if (task.saved) return res.json({ id: task.card_id || null, already: true, category: 'video' });
+  if (task.status !== 'done') return res.status(400).json({ error: '任务还没有完成，等列表里显示完成再存' });
   let text = String(task.text || '').trim();
   if (text.length < 30) return res.status(400).json({ error: '转写内容太短，不适合做素材' });
   // 自愈：入库前若当初没完成 AI 格式化（LLM 瞬时超时等），当场补一次
@@ -857,16 +908,14 @@ app.post('/api/material/link/:id/save', async (req, res) => {
     const fmtInfo = {};
     const better = await formatTranscript(text, fmtInfo);
     if (fmtInfo.ok) {
-      task.text = better;
-      task.fmt = 'ai';
       text = better;
+      db.updateLinkTask(task.id, { text, fmt: 'ai' });
     }
   }
   const meta = task.meta || {};
-  const title = cleanTitle(String((req.body || {}).title || '').trim() || titleFromDesc(meta.desc || meta.title || ''));
-  // 平台标识：解析器标了 platform 用它的；否则按任务 URL 判断（抖音 / 小红书）
-  const plat = meta.platform || (/xiaohongshu|xhslink/i.test(task.url || '') ? '小红书' : '抖音');
-  const id = db.createCard({ title, content: text, source: plat + (meta.author ? '@' + meta.author : ''), category: 'video' });
+  const title = cleanTitle(String((req.body || {}).title || '').trim() || meta.title || titleFromDesc(meta.desc || ''));
+  const id = db.createCard({ title, content: text, source: (meta.platform || task.host || '网页') + (meta.author ? '@' + meta.author : ''), category: 'video' });
+  db.updateLinkTask(task.id, { saved: 1, card_id: id });
   res.json({ id, title, category: 'video' });
 });
 app.listen(PORT, () => {

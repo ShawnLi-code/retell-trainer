@@ -1412,3 +1412,32 @@ main.interview-wrap { max-width: 980px; }
 .link-result-head b { margin-right: 4px; }
 .link-result-body { color: var(--ink-soft); margin: 6px 0 10px; white-space: pre-wrap; }
 .link-error { color: #d64545; }
+
+/* ---------- 链接解析任务列表（短视频解析页） ---------- */
+#link-task-list { margin-top: 14px; display: grid; gap: 10px; }
+.lt-row {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 14px;
+  background: var(--paper, #fffdf9);
+}
+.lt-row.running { border-color: var(--brand); }
+.lt-row.failed { background: #fdf3f0; }
+.lt-head { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
+.lt-head b { font-size: 14px; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lt-badge { flex-shrink: 0; font-size: 12px; color: var(--brand); background: var(--brand-soft); border-radius: 999px; padding: 2px 9px; }
+.lt-bar {
+  height: 6px; margin: 8px 0 6px; border-radius: 999px;
+  background: var(--brand-soft); overflow: hidden;
+}
+.lt-bar i {
+  display: block; height: 100%; border-radius: 999px;
+  background: var(--brand);
+  transition: width .5s ease;
+}
+.lt-bar.done i { background: #3f8f4f; }
+.lt-bar.fail i { background: #c0392b; }
+.lt-sub { font-size: 12.5px; color: var(--ink-soft); }
+.lt-sub .dim { font-size: 12px; }
+.lt-action { margin-top: 8px; }
+.lt-action .primary { padding: 6px 14px; font-size: 13px; }

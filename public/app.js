@@ -200,7 +200,71 @@ const LINK_IMPORT_HTML = `
       <div id="link-status"></div>
     </div>`;
 
-function bindLinkImport(root, onSaved) {
+// ---------- 链接任务列表（短视频解析页）：持久化任务 + 实时进度条 ----------
+const STEP_LABEL = { '': '排队中', fetch: '解析链接', audio: '下载音视频', transcribe: '语音转写', format: 'AI 整理格式' };
+let linkTasksTimer = null;
+
+const taskBadge = (host) => (host === '抖音' ? '🎵 抖音' : host === '小红书' ? '📕 小红书' : '🌐 网页');
+
+async function renderLinkTasks(root) {
+  const box = $('#link-task-list');
+  if (!box) return;
+  let tasks = [];
+  try {
+    tasks = (await api.get('/api/material/link/tasks?limit=20')).tasks;
+  } catch { return; }
+  if (!tasks.length) { box.innerHTML = ''; return; }
+  box.innerHTML = tasks.map((t) => {
+    const title = ((t.meta && (t.meta.desc || t.meta.title)) || t.url).split('\n')[0].trim().slice(0, 42) || t.url;
+    let barCls = '';
+    if (t.status === 'done') barCls = 'done';
+    else if (t.status === 'failed') barCls = 'fail';
+    let statusLine;
+    if (t.status === 'done') statusLine = `✅ 完成${t.meta && t.meta.author ? ' · @' + esc(t.meta.author) : ''}`;
+    else if (t.status === 'failed') statusLine = `❌ ${esc(t.error || '解析失败')}`;
+    else statusLine = `⏳ ${STEP_LABEL[t.step] || '处理中'} · ${t.pct || 0}%`;
+    const action = t.status === 'done'
+      ? (t.saved
+        ? '<span class="dim">已存入素材库 ✅</span>'
+        : `<button class="primary lt-save" data-id="${t.id}">📥 存入素材库</button>`)
+      : (t.status === 'failed' ? '<span class="dim">重新粘贴链接即可重试</span>' : '');
+    return `
+      <div class="lt-row ${t.status}">
+        <div class="lt-head"><b>${esc(title)}</b><span class="lt-badge">${taskBadge(t.host)}</span></div>
+        <div class="lt-bar ${barCls}"><i style="width:${t.pct || (t.status === 'done' ? 100 : 5)}%"></i></div>
+        <div class="lt-sub">${statusLine}<span class="dim"> · ${esc(t.created_at || '')}</span></div>
+        ${action ? `<div class="lt-action">${action}</div>` : ''}
+      </div>`;
+  }).join('');
+  box.querySelectorAll('.lt-save').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      btn.textContent = '存入中…';
+      try {
+        const r = await api.post(`/api/material/link/${btn.dataset.id}/save`, {});
+        toast(r.already ? '这条已经存过啦' : `已存入素材库：《${r.title}》`);
+        cards(root, 'video');
+      } catch (err) {
+        toast('存入失败：' + err.message);
+        btn.disabled = false;
+        btn.textContent = '📥 存入素材库';
+      }
+    });
+  });
+}
+
+function startTaskPolling(root) {
+  clearInterval(linkTasksTimer);
+  linkTasksTimer = setInterval(async () => {
+    if (!document.body.contains(root)) { clearInterval(linkTasksTimer); return; }
+    try {
+      const r = await api.get('/api/material/link/tasks?limit=20');
+      if (r.tasks.some((t) => t.status === 'queued' || t.status === 'running')) renderLinkTasks(root);
+    } catch { /* 网络抖动忽略 */ }
+  }, 3000);
+}
+
+function bindLinkImport(root, opts = {}) {
   const urlInput = $('#link-url');
   const goBtn = $('#link-go');
   const statusEl = $('#link-status');
@@ -216,7 +280,7 @@ function bindLinkImport(root, onSaved) {
       if (t.status === 'queued') setStatus('<span class="dim">已加入队列…</span>');
       else if (t.status === 'fetching' || t.status === 'audio' || t.status === 'transcribe') {
         const msg = { fetching: '解析视频信息…', audio: '下载音频…', transcribe: '🎙️ 语音转写中（约 1-2 分钟）…' }[t.step] || '处理中…';
-        setStatus(`<span class="dim">${msg}</span>`);
+        setStatus(`<span class="dim">${msg} ${t.pct || 0}%</span>`);
       } else if (t.status === 'done') {
         if (savedOk) return;
         const meta = t.meta || {};
@@ -262,9 +326,20 @@ function bindLinkImport(root, onSaved) {
     goBtn.textContent = '提交中…';
     try {
       const r = await api.post('/api/material/link', { url });
-      if (r.cached) setStatus('<span class="dim">上次解析过这条链接，正在读取结果…</span>');
-      else setStatus('<span class="dim">已提交，开始解析…</span>');
-      poll(r.taskId);
+      if (opts.onSubmitted) {
+        // 列表模式（短视频解析页）：任务进下方列表，进度条实时刷新
+        setStatus('<span class="dim">已加入下方列表，实时显示进度 ↓</span>');
+        opts.onSubmitted();
+        setTimeout(() => { if (statusEl && statusEl.textContent.includes('已加入下方列表')) statusEl.innerHTML = ''; }, 3000);
+        goBtn.disabled = false;
+        goBtn.textContent = '解析';
+      } else if (r.cached) {
+        setStatus('<span class="dim">上次解析过这条链接，正在读取结果…</span>');
+        poll(r.taskId); // 轮询模式下按钮保持禁用，直到完成/失败再恢复
+      } else {
+        setStatus('<span class="dim">已提交，开始解析…</span>');
+        poll(r.taskId);
+      }
     } catch (err) {
       setStatus(`<div class="link-error">⚠️ ${esc(err.message)}</div>`);
       goBtn.disabled = false;
@@ -712,6 +787,7 @@ async function cards(root, sub = 'ted') {
       </div>
       <div id="rss-health" class="dim hidden"></div>` : `
       ${LINK_IMPORT_HTML}
+      <div id="link-task-list"></div>
       <p class="dim">解析成功的文字稿就存在本页列表里，点「直接练」即可开始复述。</p>`}
     <ul class="card-list">
       ${items.map((c) => `
@@ -758,7 +834,11 @@ async function cards(root, sub = 'ted') {
     });
   }
 
-  bindLinkImport(root, () => cards(root, cat));
+  bindLinkImport(root, { onSaved: () => cards(root, cat), onSubmitted: () => renderLinkTasks(root) });
+  if (cat === 'video') {
+    renderLinkTasks(root);
+    startTaskPolling(root);
+  }
 
   if (cat === 'story') {
     const reprocessBtn = $('#rss-reprocess-btn');

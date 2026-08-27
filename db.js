@@ -56,6 +56,23 @@ CREATE TABLE IF NOT EXISTS book_marks (
   note TEXT DEFAULT '',
   created_at TEXT DEFAULT (datetime('now','localtime'))
 );
+
+CREATE TABLE IF NOT EXISTS link_tasks (
+  id TEXT PRIMARY KEY,
+  url TEXT NOT NULL,
+  host TEXT DEFAULT '',
+  status TEXT DEFAULT 'queued',
+  step TEXT DEFAULT '',
+  pct INTEGER DEFAULT 3,
+  meta TEXT,
+  text TEXT DEFAULT '',
+  error TEXT DEFAULT '',
+  fmt TEXT DEFAULT '',
+  saved INTEGER DEFAULT 0,
+  card_id INTEGER,
+  created_at TEXT DEFAULT (datetime('now','localtime')),
+  updated_at TEXT DEFAULT (datetime('now','localtime'))
+);
 `);
 
 // 兼容旧库：补 category 列
@@ -244,6 +261,49 @@ function listBookMarks(bookId) {
   return listMarksStmt.all(bookId);
 }
 
+// ---------- 链接解析任务（持久化：重启不丢，列表实时可见进度） ----------
+// 服务重启后，把残留的 queued/running 任务标记为失败（进程已不在，任务不会自己续跑）
+try {
+  db.prepare(`UPDATE link_tasks SET status = 'failed', error = '服务重启导致中断，请重新粘贴链接重试', pct = 0, updated_at = datetime('now','localtime') WHERE status IN ('queued','running')`).run();
+} catch { /* 表可能刚建 */ }
+
+const insertLinkTaskStmt = db.prepare(`INSERT INTO link_tasks (id, url, host) VALUES (?, ?, ?)`);
+const getLinkTaskStmt = db.prepare(`SELECT * FROM link_tasks WHERE id = ?`);
+const listLinkTaskStmt = db.prepare(`SELECT * FROM link_tasks ORDER BY created_at DESC, rowid DESC LIMIT ?`);
+const doneTaskByUrlStmt = db.prepare(`SELECT id FROM link_tasks WHERE url = ? AND status = 'done' ORDER BY created_at DESC LIMIT 1`);
+const LINK_TASK_FIELDS = ['status', 'step', 'pct', 'meta', 'text', 'error', 'fmt', 'saved', 'card_id'];
+
+function createLinkTask({ id, url, host = '' }) {
+  insertLinkTaskStmt.run(id, url, host);
+}
+
+function updateLinkTask(id, patch) {
+  const keys = Object.keys(patch).filter((k) => LINK_TASK_FIELDS.includes(k));
+  if (!keys.length) return;
+  const sets = keys.map((k) => `${k} = ?`).join(', ');
+  const vals = keys.map((k) => (k === 'meta' && patch[k] && typeof patch[k] === 'object' ? JSON.stringify(patch[k]) : patch[k]));
+  db.prepare(`UPDATE link_tasks SET ${sets}, updated_at = datetime('now','localtime') WHERE id = ?`).run(...vals, id);
+}
+
+function getLinkTask(id) {
+  const row = getLinkTaskStmt.get(id);
+  if (!row) return null;
+  try { row.meta = row.meta ? JSON.parse(row.meta) : null; } catch { row.meta = null; }
+  return row;
+}
+
+function listLinkTasks(limit = 30) {
+  return listLinkTaskStmt.all(limit).map((row) => {
+    try { row.meta = row.meta ? JSON.parse(row.meta) : null; } catch { row.meta = null; }
+    return row;
+  });
+}
+
+function findDoneTaskByUrl(url) {
+  const row = doneTaskByUrlStmt.get(url);
+  return row ? row.id : null;
+}
+
 // ---------- stats ----------
 function totalSessions() {
   return Number(db.prepare(`SELECT COUNT(*) AS n FROM sessions`).get().n);
@@ -275,5 +335,10 @@ module.exports = {
   deleteBookMark,
   deleteBookMarksByBook,
   listBookMarks,
+  createLinkTask,
+  updateLinkTask,
+  getLinkTask,
+  listLinkTasks,
+  findDoneTaskByUrl,
   totalSessions,
 };
