@@ -155,15 +155,7 @@ async function home(root) {
         </button>`).join('')}
     </div>
     <div id="pick-status" class="dim"></div>
-    <div class="link-import">
-      <h3>🔗 粘贴链接，直接生成复述素材</h3>
-      <p class="dim">抖音 / 小红书的视频分享链接 → 自动解析并转写文字稿 → 一键存入素材库。视频约 1-2 分钟转写完成。</p>
-      <div class="link-import-row">
-        <input id="link-url" type="text" placeholder="粘贴 v.douyin.com/... 或 xhslink.com/... 分享链接" />
-        <button id="link-go" class="primary">解析</button>
-      </div>
-      <div id="link-status"></div>
-    </div>`;
+    ${LINK_IMPORT_HTML}`;
 
   root.querySelectorAll('.pick-card').forEach((btn) => {
     btn.addEventListener('click', async () => {
@@ -187,6 +179,17 @@ async function home(root) {
 }
 
 // ---------- 链接 → 复述素材（抖音/小红书） ----------
+const LINK_IMPORT_HTML = `
+    <div class="link-import">
+      <h3>🔗 粘贴链接，直接生成复述素材</h3>
+      <p class="dim">抖音 / 小红书分享的<b>整段文案</b>直接丢进来就行（内含 v.douyin.com 或 xhslink.com 链接即可）→ 自动解析转写文字稿 → 一键存入素材库。视频约 1-2 分钟转写完成。</p>
+      <div class="link-import-row">
+        <input id="link-url" type="text" placeholder="粘贴整段分享文案或链接：8.92 复制打开抖音… https://v.douyin.com/…" />
+        <button id="link-go" class="primary">解析</button>
+      </div>
+      <div id="link-status"></div>
+    </div>`;
+
 function bindLinkImport(root) {
   const urlInput = $('#link-url');
   const goBtn = $('#link-go');
@@ -633,6 +636,7 @@ async function cards(root, sub = 'ted') {
         <button id="rss-health-btn" class="ghost">查看来源状态</button>
       </div>
       <div id="rss-health" class="dim hidden"></div>`}
+    ${LINK_IMPORT_HTML}
     <ul class="card-list">
       ${items.map((c) => `
         <li class="card-row">
@@ -677,6 +681,8 @@ async function cards(root, sub = 'ted') {
       }
     });
   }
+
+  bindLinkImport(root);
 
   if (cat === 'story') {
     const reprocessBtn = $('#rss-reprocess-btn');

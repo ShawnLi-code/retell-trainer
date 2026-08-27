@@ -739,20 +739,31 @@ function pumpLinkQueue() {
   });
 }
 
+// 抖音 App 分享复制的是整段文案：「8.92 复制打开抖音，看看【…】… https://v.douyin.com/xxx/ D@U.LW MjP:/ :1pm 08/09」
+// 用户常直接整段粘贴，所以从任意文本里把真正的链接抠出来；没写协议时兜底认短链域名。
+function extractShareUrl(raw) {
+  let m = raw.match(/https?:\/\/[^\s'"<>，。《》【】（）()]+/i);
+  if (m) return m[0].replace(/[.,;:!?，。；：！？）】"'’”]+$/, '');
+  // 没写协议的裸短链（v.douyin.com/xxx），自动补上 https://
+  m = raw.match(/(?:v\.douyin\.com|xhslink\.com)\/[A-Za-z0-9_-]+\/?/i);
+  return m ? 'https://' + m[0].replace(/[.,;:!?，。；：！？）】"'’”]+$/, '') : '';
+}
+
 app.post('/api/material/link', (req, res) => {
   const raw = String((req.body || {}).url || '').trim();
+  const url = extractShareUrl(raw) || raw;
   let host;
-  try { host = new URL(raw).hostname.replace(/^www\./, ''); } catch { return res.status(400).json({ error: '链接格式不对，请粘贴完整链接' }); }
+  try { host = new URL(url).hostname.replace(/^www\./, ''); } catch { return res.status(400).json({ error: '没找到有效链接——抖音/小红书分享的整段文案可以直接粘贴（内含 v.douyin.com 或 xhslink.com 链接即可）' }); }
   if (!LINK_ALLOWED_HOSTS.includes(host)) {
     return res.status(400).json({ error: '目前支持抖音（douyin.com）和小红书（xiaohongshu.com）的分享链接' });
   }
   // 简单去重：同一 URL 进行中/完成的任务直接复用（读取最近 10 个）
   for (const t of linkTasks.values()) {
-    if (t.url === raw && (t.status === 'done' || t.status === 'failed')) {
+    if (t.url === url && (t.status === 'done' || t.status === 'failed')) {
       return res.json({ taskId: t.id, cached: true });
     }
   }
-  const task = { id: randomUUID().slice(0, 8), url: raw, status: 'queued', step: '', meta: null, text: '', error: '', created: Date.now() };
+  const task = { id: randomUUID().slice(0, 8), url: url, status: 'queued', step: '', meta: null, text: '', error: '', created: Date.now() };
   linkTasks.set(task.id, task);
   linkQueue.push(task);
   pumpLinkQueue();
