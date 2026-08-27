@@ -2,6 +2,7 @@
 const express = require('express');
 const path = require('node:path');
 const fs = require('node:fs');
+const os = require('node:os');
 const { execFile } = require('node:child_process');
 const { randomUUID } = require('node:crypto');
 const db = require('./db');
@@ -117,6 +118,36 @@ app.post('/api/practice/pick', (req, res) => {
   const card = pool[0]; // 直接给当前最短的完整素材
   res.json({ card: { id: card.id, title: card.title, content: card.content, length: card.content.length } });
 });
+
+// ---------- 练习录音 → 服务端 Whisper 转写（不再依赖浏览器 ASR） ----------
+app.post('/api/practice/transcribe',
+  express.raw({ type: (req) => String(req.headers['content-type'] || '').startsWith('audio/'), limit: '30mb' }),
+  async (req, res) => {
+    try {
+      const buf = Buffer.isBuffer(req.body) ? req.body : null;
+      if (!buf || !buf.length) return res.status(400).json({ error: '没有收到录音数据' });
+      if (!fs.existsSync(ASR_SCRIPT) || !fs.existsSync(PY_BIN)) {
+        return res.status(502).json({ error: '服务器没配置语音转写，请直接打字或稍后再试' });
+      }
+      const ct = String(req.headers['content-type'] || '').toLowerCase().split(';')[0].trim();
+      const extMap = { 'audio/webm': '.webm', 'audio/ogg': '.ogg', 'audio/mpeg': '.mp3', 'audio/mp4': '.m4a', 'audio/wav': '.wav', 'audio/x-wav': '.wav' };
+      const dir = process.platform === 'win32' ? path.join(os.tmpdir(), 'retell-audio') : '/tmp';
+      fs.mkdirSync(dir, { recursive: true });
+      const audioPath = path.join(dir, 'practice-' + randomUUID().slice(0, 8) + (extMap[ct] || '.webm'));
+      fs.writeFileSync(audioPath, buf);
+      try {
+        const asr = await pyRun(ASR_SCRIPT, audioPath, 10 * 60 * 1000);
+        if (!asr.ok) return res.status(502).json({ error: asr.error || '语音转写失败' });
+        const text = await formatTranscript(cleanTranscript(asr.text));
+        res.json({ text });
+      } finally {
+        try { fs.unlinkSync(audioPath); } catch { /* */ }
+      }
+    } catch (err) {
+      console.error('[practice transcribe]', err.message);
+      res.status(500).json({ error: '转写服务出错：' + String(err.message || err).slice(0, 100) });
+    }
+  });
 
 // ---------- 语料抓取 ----------
 app.post('/api/cards/fetch-rmrb', async (req, res) => {
@@ -690,7 +721,7 @@ async function runLinkTask(task, url) {
       task.step = 'transcribe';
       const asr = await pyRun(ASR_SCRIPT, audioPath, 30 * 60 * 1000);
       if (!asr.ok) return fail(task, asr.error || '语音转写失败');
-      task.text = cleanTranscript(asr.text);
+      task.text = await formatTranscript(cleanTranscript(asr.text));
       task.status = 'done';
     } else if (/xiaohongshu|xhslink/i.test(url)) {
       task.step = 'fetch';
@@ -714,7 +745,27 @@ async function runLinkTask(task, url) {
 }
 
 function cleanTranscript(t) {
-  return String(t || '').replace(/\s+/g, '').trim();
+  // 保留换行、不吞标点（whisper 偶尔会自带分句）；原始的一坨交给 AI 格式化
+  return String(t || '').replace(/\r\n?/g, '\n').replace(/[ \t\u3000]+/g, ' ').trim();
+}
+
+// 转写稿格式化：LLM 补标点、分段；失败静默回退原文，绝不因此让任务失败
+async function formatTranscript(raw) {
+  const text = String(raw || '').trim();
+  if (!text || !isConfigured()) return text;
+  try {
+    const out = await chat(
+      [{ role: 'system', content: prompts.transcriptFormatSystem(text.slice(0, 6000)) }],
+      { temperature: 0.2 }
+    );
+    const cleaned = String(out || '').replace(/^["'「『]+|["'」』]+$/g, '').trim();
+    // 合理性检查：输出不能比原文缩水太多（防止模型偷懒概括）
+    if (cleaned.length >= Math.max(text.length * 0.5, 20)) return cleaned;
+    console.error(`[转写格式化] 输出过短(${text.length} -> ${cleaned.length})，回退原文`);
+  } catch (err) {
+    console.error('[转写格式化]', err.message);
+  }
+  return text;
 }
 
 function fail(task, error) {

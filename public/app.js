@@ -52,6 +52,16 @@ const api = {
     if (!r.ok) throw new Error(data.error || '请求失败');
     return data;
   },
+  async raw(path, blob) {
+    const r = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': blob.type || 'audio/webm' },
+      body: blob,
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || '请求失败');
+    return data;
+  },
   async del(path) {
     const r = await fetch(path, { method: 'DELETE' });
     const data = await r.json().catch(() => ({}));
@@ -443,9 +453,12 @@ function renderReport(report, userText) {
   $('#chat').appendChild(div);
 }
 
-// ---------- 录音转写（Web Speech API） ----------
+// ---------- 录音转写（MediaRecorder → 服务端 Whisper；浏览器识别只做实时字幕） ----------
 let recognition = null;
 let recording = false;
+let mediaRecorder = null;
+let recStream = null;
+let recordChunks = [];
 
 const setMic = (btn, label, icon = ICONS.mic) => {
   btn.innerHTML = iconBtn(icon, label);
@@ -457,26 +470,26 @@ function setupMic(textarea, interimEl, micBtn, sendBtn, opts = {}) {
   const CONTINUE_LABEL = opts.continueLabel || '继续（剩 {s}s）';
   const TIMER_PREFIX = opts.timerPrefix || '剩余';
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SR) {
-    micBtn.disabled = true;
-    micBtn.textContent = '浏览器不支持语音（请用 Edge）';
-    return {};
-  }
   if (!window.isSecureContext) {
     micBtn.disabled = true;
     micBtn.textContent = '语音需要 localhost 或 https 访问（当前地址不是）';
     return {};
   }
+  // 最终文本一律由服务端 Whisper 转写；浏览器识别只提供实时字幕（可选）
+  const canRecord = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
+  if (!canRecord) {
+    micBtn.disabled = true;
+    micBtn.textContent = '浏览器不支持录音，请直接打字';
+    return {};
+  }
   const errorMsg = {
     'not-allowed': '麦克风权限被拒绝：请点地址栏左侧的锁/图标，允许麦克风后重试',
-    'no-speech': '没听到声音，请靠近麦克风再试',
-    'network': '语音服务连不上（建议换 Edge 浏览器，或直接打字）',
-    'aborted': '录音被中断，请重试',
     'audio-capture': '没有检测到麦克风，请检查设备',
-    'service-not-allowed': '语音服务不可用，建议换 Edge 浏览器或直接打字',
   };
-  let confirmed = ''; // 累积所有已确认的转写文本（含手动输入，永不覆盖）
-  let remain = DUR;   // 本轮剩余秒数：断连重连时保留，新轮 reset()
+  let confirmed = '';  // 浏览器字幕的累积文本（仅展示参考）
+  let baseText = '';   // 本轮开始前输入框已有的内容，转写结果拼在它后面
+  let remain = DUR;    // 本轮剩余秒数：断连重连时保留，新轮 reset()
+  let submitting = false;
 
   // ---------- 时限：到点自动停录并提交；断连重连从剩余时间接续 ----------
   let timerId = null;
@@ -505,9 +518,7 @@ function setupMic(textarea, interimEl, micBtn, sendBtn, opts = {}) {
         clearInterval(timerId);
         timerId = null;
         if (el) el.textContent = '⏱ 时间到，正在提交…';
-        if (recording) { try { recognition.stop(); } catch { /* */ } }
-        // 等 onend 把最后的转写尾巴并入文本框，再自动提交
-        if (sendBtn && !sendBtn.disabled) setTimeout(() => sendBtn.click(), 800);
+        finishRecording({ autoSubmit: true });
       }
     }, 1000);
   };
@@ -520,55 +531,118 @@ function setupMic(textarea, interimEl, micBtn, sendBtn, opts = {}) {
       ? CONTINUE_LABEL.replace('{s}', remain)
       : START_LABEL;
 
-  micBtn.addEventListener('click', async () => {
-    if (recording) { recognition.stop(); return; }
-    if (opts.onStart) { try { await opts.onStart(); } catch (err) { toast(err.message); return; } }
-    recognition = new SR();
-    recognition.lang = 'zh-CN';
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    confirmed = textarea.value; // 保留已输入的内容，转写结果持续追加在后面
+  function releaseStream() {
+    try { recStream && recStream.getTracks().forEach((t) => t.stop()); } catch { /* */ }
+    recStream = null;
+  }
 
-    recognition.onresult = (e) => {
-      let interim = '';
-      for (let i = e.resultIndex; i < e.results.length; i++) {
-        const t = e.results[i][0].transcript;
-        if (e.results[i].isFinal) confirmed += t; // 已确认的文本永久累积
-        else interim += t;
+  async function startRecording() {
+    try {
+      recStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (err) {
+      const code = err && err.name === 'NotFoundError' ? 'audio-capture' : err && err.name === 'NotAllowedError' ? 'not-allowed' : '';
+      toast(errorMsg[code] || ('麦克风打开失败：' + (err.message || err)));
+      return;
+    }
+    if (opts.onStart) {
+      try { await opts.onStart(); } catch (err) {
+        releaseStream();
+        toast(err.message);
+        return;
       }
-      textarea.value = confirmed;
-      interimEl.textContent = interim;
-    };
-    recognition.onend = () => {
-      recording = false;
-      stopTimer();
-      setMic(micBtn, micLabel());
-      // 停下来时若还有未确认的尾巴，并入文本框，避免丢失最后一句话
-      const tail = interimEl.textContent.trim();
-      if (tail) {
-        confirmed += tail;
-        textarea.value = confirmed;
-        if (opts.onText) opts.onText(confirmed);
+    }
+    try {
+      let mime = '';
+      if (window.MediaRecorder.isTypeSupported) {
+        if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) mime = 'audio/webm;codecs=opus';
+        else if (MediaRecorder.isTypeSupported('audio/webm')) mime = 'audio/webm';
+        else if (MediaRecorder.isTypeSupported('audio/mp4')) mime = 'audio/mp4';
       }
-      interimEl.textContent = '';
-    };
-    recognition.onerror = (e) => {
-      recording = false;
-      stopTimer();
-      setMic(micBtn, micLabel());
-      toast(errorMsg[e.error] || ('语音识别出错：' + e.error));
-    };
+      mediaRecorder = mime ? new MediaRecorder(recStream, { mimeType: mime }) : new MediaRecorder(recStream);
+    } catch (err) {
+      releaseStream();
+      toast('录音启动失败：' + (err.message || err));
+      return;
+    }
+    recordChunks = [];
+    mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size) recordChunks.push(e.data); };
+    confirmed = textarea.value; // 字幕从现有内容后面接
+    baseText = textarea.value;
     recording = true;
     setMic(micBtn, '停止录音', ICONS.stop);
-    try {
-      recognition.start();
-      startTimer();
-    } catch (err) {
-      recording = false;
-      stopTimer();
-      setMic(micBtn, micLabel());
-      toast('语音启动失败：' + err.message + '（建议换 Edge 浏览器，或直接打字）');
+
+    // 实时字幕（纯展示）：失败静默放弃，不影响录音与最终转写
+    if (SR) {
+      recognition = new SR();
+      recognition.lang = 'zh-CN';
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.onresult = (e) => {
+        let interim = '';
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+          const t = e.results[i][0].transcript;
+          if (e.results[i].isFinal) confirmed += t;
+          else interim += t;
+        }
+        textarea.value = confirmed;
+        interimEl.textContent = interim;
+      };
+      recognition.onerror = () => { /* 字幕服务不可用就静默降级 */ };
+      try { recognition.start(); } catch { /* 忽略 */ }
+    } else if (interimEl) {
+      interimEl.textContent = '（实时字幕不支持当前浏览器，停录后由服务器转写）';
     }
+
+    mediaRecorder.start(1000);
+    startTimer();
+  }
+
+  async function finishRecording({ autoSubmit = false } = {}) {
+    if (!recording || submitting) return;
+    recording = false;
+    submitting = true;
+    stopTimer();
+    setMic(micBtn, 'AI 转写中…', ICONS.sparkles);
+    const rec = mediaRecorder;
+    const mime = (rec && rec.mimeType) || 'audio/webm';
+    const blobP = new Promise((resolve) => {
+      if (!rec || rec.state === 'inactive') return resolve(null);
+      rec.onstop = () => resolve(new Blob(recordChunks, { type: mime }));
+      try { rec.requestData(); rec.stop(); } catch { resolve(new Blob(recordChunks, { type: mime })); }
+    });
+    stopInterim();
+    const blob = await blobP.catch(() => null);
+    releaseStream();
+    await new Promise((r) => setTimeout(r, 350)); // 等字幕 onend 把最后一句尾巴并进 confirmed
+
+    let ok = false;
+    if (blob && blob.size > 2000) {
+      try {
+        const r = await api.raw('/api/practice/transcribe', blob);
+        if (r.text && r.text.trim()) {
+          confirmed = (baseText ? baseText + '\n' : '') + r.text.trim();
+          ok = true;
+        }
+      } catch (err) {
+        toast('服务器转写没成功，先用浏览器识别的文本：' + err.message);
+      }
+    }
+    textarea.value = ok ? confirmed : (confirmed || '');
+    if (interimEl) interimEl.textContent = '';
+    if (opts.onText) opts.onText(textarea.value);
+    submitting = false;
+    setMic(micBtn, micLabel());
+    if (autoSubmit && sendBtn && !sendBtn.disabled) setTimeout(() => sendBtn.click(), 400);
+  }
+
+  function stopInterim() {
+    try { recognition && recognition.stop(); } catch { /* */ }
+  }
+
+  micBtn.addEventListener('click', () => {
+    if (submitting) return;
+    if (recording) { finishRecording(); return; }
+    startRecording();
   });
 
   // 新轮开始：重置剩余时间；返回句柄供页面在换题/提交后调用

@@ -104,4 +104,16 @@ function generateCardSystem(topic) {
 只输出正文，不要输出标题或任何多余内容。`;
 }
 
-module.exports = { audienceTurnSystem, audienceChatSystem, reportSystem, generateCardSystem, speechFeedbackSystem };
+/** 语音转写稿格式化：只补标点分段，绝不改写内容 */
+function transcriptFormatSystem(text) {
+  return `你在整理一段"语音识别的原始输出"，它几乎没有标点、没有分段。请整理成方便阅读的中文文本，规则：
+1. 补全标点（逗号/句号/问号/感叹号），按意思分成若干自然段，每段 2-5 句，段与段之间空一行；
+2. 只修正明显的同音字错别字，拿不准的原样保留；
+3. 绝对不改写句式、不概括、不总结、不增删任何信息，口头语气词（哎、嘛、然后）原样保留；
+4. 直接输出整理后的正文，不要任何解释、前缀、标题或引号。
+
+原始转写：
+${text}`;
+}
+
+module.exports = { audienceTurnSystem, audienceChatSystem, reportSystem, generateCardSystem, speechFeedbackSystem, transcriptFormatSystem };
