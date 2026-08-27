@@ -21,8 +21,17 @@ jobs:
           script: |
             set -e
             cd /home/Shawn/project/retell-trainer
-            echo "== git pull =="
-            git pull --ff-only origin main
+            echo "== git pull（github 直连不稳定，重试 5 次）=="
+            pull_ok=0
+            for i in 1 2 3 4 5; do
+              if git pull --ff-only origin main; then pull_ok=1; break; fi
+              echo "  第 ${i} 次拉取失败，5 秒后重试…"
+              sleep 5
+            done
+            if [ "$pull_ok" != "1" ]; then
+              echo "== git pull 连续失败，中止部署（服务保持当前版本运行）=="
+              exit 1
+            fi
             if git diff --quiet HEAD~1 HEAD -- package.json package-lock.json; then
               echo "== 依赖无变化，跳过 npm install =="
             else
