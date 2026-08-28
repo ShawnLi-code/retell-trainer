@@ -814,7 +814,10 @@ async function cards(root, sub = 'ted') {
             <b>${esc(c.title)}</b>
             <span class="dim">${materialDate(c.published_at)} · ${c.content.length} 字${lenBadge(c.content.length)} · ${sourceHtml(c.source)}${c.used_at ? ' · 练过' : ' · 未练'}</span>
           </div>
-          <button class="practice-btn" data-id="${c.id}">直接练</button>
+          <div class="row-actions">
+            <button class="practice-btn" data-id="${c.id}">直接练</button>
+            <button class="ghost del-btn" data-id="${c.id}" data-title="${esc(c.title)}">删除</button>
+          </div>
         </li>`).join('') || `<li class="dim">「${esc(catMeta.name)}」还没有素材${cat === 'rmrb' ? '，点上面按钮抓取今日评论' : cat === 'short' ? '，点上面按钮抓取每日短评' : cat === 'story' ? '，点上面按钮立即抓取订阅源' : cat === 'video' ? '，把抖音/小红书分享文案粘到上面，点「解析」' : '，粘贴一个 TED 演讲链接导入'}</li>`}
     </ul>`;
 
@@ -914,6 +917,25 @@ async function cards(root, sub = 'ted') {
       const card = items.find((c) => c.id === Number(pb.dataset.id));
       // 和首页抽卡一样：先弹完整素材卡，读了点「我准备好了」才开始
       if (card) showMaterialModal(card, () => startPractice(card));
+    });
+  });
+
+  root.querySelectorAll('.del-btn').forEach((db) => {
+    db.addEventListener('click', async () => {
+      const id = Number(db.dataset.id);
+      const title = db.dataset.title || '这条素材';
+      if (!confirm(`确定删除《${title}》？\n删除后不可恢复，且它的练习记录会从历史页消失。`)) return;
+      db.disabled = true;
+      db.textContent = '删除中…';
+      try {
+        await api.del(`/api/cards/${id}`);
+        toast('已删除');
+        cards(root, cat);
+      } catch (err) {
+        toast('删除失败：' + err.message);
+        db.disabled = false;
+        db.textContent = '删除';
+      }
     });
   });
 }

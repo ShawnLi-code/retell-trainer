@@ -104,6 +104,15 @@ app.post('/api/cards', (req, res) => {
   res.json({ id });
 });
 
+app.delete('/api/cards/:id', (req, res) => {
+  const id = Number(req.params.id);
+  if (!id) return res.status(400).json({ error: '参数不对' });
+  const card = db.getCard(id);
+  if (!card) return res.status(404).json({ error: '素材不存在' });
+  db.deleteCard(id);
+  res.json({ ok: true });
+});
+
 // ---------- 练习选卡：板块 -> 完整素材（短素材优先，适配复述） ----------
 app.post('/api/practice/pick', (req, res) => {
   const category = String((req.body || {}).category || '');

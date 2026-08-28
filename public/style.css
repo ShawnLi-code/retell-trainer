@@ -344,6 +344,17 @@ textarea:focus, input:focus { outline: none; border-color: var(--brand); backgro
   flex-shrink: 0;
 }
 .practice-btn:hover { border-color: var(--brand); color: var(--brand); }
+.row-actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+.del-btn {
+  font-size: 13px;
+  padding: 6px 12px;
+  border-color: #e3c1b8;
+  color: #b3402e;
+  background: none;
+  flex-shrink: 0;
+}
+.del-btn:hover { border-color: #b3402e; color: #8f2f20; background: #fdf3f0; }
+.del-btn:disabled { opacity: .5; cursor: default; }
 
 .dim { color: var(--ink-dim); font-size: 12px; }
 
