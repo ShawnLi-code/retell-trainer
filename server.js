@@ -932,7 +932,7 @@ app.post('/api/material/link/:id/reformat', async (req, res) => {
   const fmtInfo = {};
   const better = await formatTranscript(String(card.content || ''), fmtInfo);
   if (!fmtInfo.ok) return res.status(502).json({ error: 'AI 整理没成功：' + (fmtInfo.skip || '未知原因') + '，稍后再试' });
-  db.updateCard(task.card_id, { content: better });
+  db.updateCard(task.card_id, { title: card.title, content: better });
   db.updateLinkTask(task.id, { fmt: 'ai', text: better });
   res.json({ id: task.card_id, length: better.length });
 });
