@@ -767,6 +767,9 @@ async function transcribeToTask(taskId, audioPath) {
 
 async function runLinkTask(taskId, url) {
   const plat = classifyPlatform(url);
+  // 任务可能已被用户删除/取消（进行中可删）→ 不再处理
+  const fresh = db.getLinkTask(taskId);
+  if (!fresh || (fresh.status !== 'queued' && fresh.status !== 'running')) return;
   try {
     updTask(taskId, { status: 'running', step: 'fetch' });
     if (plat === '抖音') {
@@ -817,6 +820,8 @@ function cleanTranscript(t) {
 }
 
 // 转写稿格式化：LLM 补标点、分段；失败静默回退原文，绝不因此让任务失败。
+// 总时长上限 FORMAT_TIMEOUT_MS（默认 100 秒）：模型链逐渠道兜底可能拖到 5 分钟，
+// 等太久体验差，超时直接回退原文（任务照样完成，走「✨ AI 整理格式」补救按钮即可）。
 // info 参数回传诊断信息（info.ok = 是否经 AI 格式化；info.skip = 回退原因）
 async function formatTranscript(raw, info) {
   const text = String(raw || '').trim();
@@ -825,10 +830,13 @@ async function formatTranscript(raw, info) {
     return text;
   }
   try {
-    const out = await chat(
-      [{ role: 'system', content: prompts.transcriptFormatSystem(text.slice(0, 6000)) }],
-      { temperature: 0.2 }
-    );
+    const out = await Promise.race([
+      chat(
+        [{ role: 'system', content: prompts.transcriptFormatSystem(text.slice(0, 6000)) }],
+        { temperature: 0.2 }
+      ),
+      new Promise((_r, rej) => setTimeout(() => rej(new Error('格式化超时')), Number(process.env.FORMAT_TIMEOUT_MS) || 100000)),
+    ]);
     const cleaned = String(out || '').replace(/^["'「『]+|["'」』]+$/g, '').trim();
     // 合理性检查：输出不能比原文缩水太多（防止模型偷懒概括）
     if (cleaned.length >= Math.max(text.length * 0.5, 20)) {
@@ -875,6 +883,9 @@ app.post('/api/material/link', (req, res) => {
   }
   const cachedId = db.findDoneTaskByUrl(url);
   if (cachedId) return res.json({ taskId: cachedId, cached: true });
+  // 同链接已有进行中任务：复用，避免重复提交产生两个任务（两个进度条）
+  const activeId = db.findActiveTaskByUrl(url);
+  if (activeId) return res.json({ taskId: activeId, cached: true, active: true });
   const task = { id: randomUUID().slice(0, 8), url, host: classifyPlatform(url) };
   db.createLinkTask(task);
   linkQueue.push(task);
@@ -885,6 +896,16 @@ app.post('/api/material/link', (req, res) => {
 // 任务列表（持久化）：前端"短视频解析"页实时渲染进度条
 app.get('/api/material/link/tasks', (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 20, 50);
+  // 兜底 watchdog：queued/running 超过 25 分钟视为卡死（正常单任务最多约 12 分钟：
+  // 转写 30s~10min + 格式化 100s），标为失败让用户重试，避免"永远挂着"
+  const cutoff = new Date(Date.now() - 25 * 60 * 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  const cutoffStr = `${cutoff.getFullYear()}-${pad(cutoff.getMonth() + 1)}-${pad(cutoff.getDate())} ${pad(cutoff.getHours())}:${pad(cutoff.getMinutes())}:${pad(cutoff.getSeconds())}`;
+  for (const t of db.listLinkTasks(100)) {
+    if ((t.status === 'queued' || t.status === 'running') && String(t.updated_at || '') < cutoffStr) {
+      db.updateLinkTask(t.id, { status: 'failed', error: '处理超时自动放弃（可能网络卡了），重新粘贴链接即可重试', pct: 100 });
+    }
+  }
   res.json({
     tasks: db.listLinkTasks(limit).map((t) => ({
       id: t.id, url: t.url, host: t.host, status: t.status, step: t.step, pct: t.pct,

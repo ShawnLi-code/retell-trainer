@@ -231,10 +231,11 @@ async function renderLinkTasks(root) {
           : '<span class="dim">已存入素材库 ✅</span>')
         : `<button class="primary lt-save" data-id="${t.id}">📥 存入素材库</button>`)
       : (t.status === 'failed' ? '<span class="dim">重新粘贴链接即可重试</span>' : '');
-    const canDel = t.status === 'done' || t.status === 'failed';
+    const canDel = true; // 任何状态都可删/取消（进行中删除=取消解析，后端任务会跳过）
+    const delTip = (t.status === 'queued' || t.status === 'running') ? '取消这条解析' : '删除这条解析记录';
     return `
       <div class="lt-row ${t.status}">
-        <div class="lt-head"><b>${esc(title)}</b><span class="lt-right"><span class="lt-badge">${taskBadge(t.host)}</span>${canDel ? `<button class="lt-del" data-id="${t.id}" title="删除这条解析记录">×</button>` : ''}</span></div>
+        <div class="lt-head"><b>${esc(title)}</b><span class="lt-right"><span class="lt-badge">${taskBadge(t.host)}</span>${canDel ? `<button class="lt-del" data-id="${t.id}" title="${delTip}">×</button>` : ''}</span></div>
         <div class="lt-bar ${barCls}"><i style="width:${t.pct || (t.status === 'done' ? 100 : 5)}%"></i></div>
         <div class="lt-sub">${statusLine}<span class="dim"> · ${esc(t.created_at || '')}</span></div>
         ${action ? `<div class="lt-action">${action}</div>` : ''}

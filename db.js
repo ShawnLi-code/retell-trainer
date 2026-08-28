@@ -304,6 +304,13 @@ function findDoneTaskByUrl(url) {
   return row ? row.id : null;
 }
 
+// 进行中的同链接任务复用（防止重复提交产生两个解析任务）
+const activeTaskByUrlStmt = db.prepare(`SELECT id FROM link_tasks WHERE url = ? AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1`);
+function findActiveTaskByUrl(url) {
+  const row = activeTaskByUrlStmt.get(url);
+  return row ? row.id : null;
+}
+
 const deleteLinkTaskStmt = db.prepare(`DELETE FROM link_tasks WHERE id = ?`);
 
 function deleteLinkTask(id) {
@@ -346,6 +353,7 @@ module.exports = {
   getLinkTask,
   listLinkTasks,
   findDoneTaskByUrl,
+  findActiveTaskByUrl,
   deleteLinkTask,
   totalSessions,
 };
