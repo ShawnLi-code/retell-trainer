@@ -39,6 +39,7 @@ const api = {
   async get(path) {
     const r = await fetch(path);
     const data = await r.json().catch(() => ({}));
+    if (r.status === 401 && data.needAuth) { showAuthGate(); throw new Error('请先输入邀请码'); }
     if (!r.ok) throw new Error(data.error || '请求失败');
     return data;
   },
@@ -49,6 +50,7 @@ const api = {
       body: JSON.stringify(body || {}),
     });
     const data = await r.json().catch(() => ({}));
+    if (r.status === 401 && data.needAuth) { showAuthGate(); throw new Error('请先输入邀请码'); }
     if (!r.ok) throw new Error(data.error || '请求失败');
     return data;
   },
@@ -59,16 +61,94 @@ const api = {
       body: blob,
     });
     const data = await r.json().catch(() => ({}));
+    if (r.status === 401 && data.needAuth) { showAuthGate(); throw new Error('请先输入邀请码'); }
     if (!r.ok) throw new Error(data.error || '请求失败');
     return data;
   },
   async del(path) {
     const r = await fetch(path, { method: 'DELETE' });
     const data = await r.json().catch(() => ({}));
+    if (r.status === 401 && data.needAuth) { showAuthGate(); throw new Error('请先输入邀请码'); }
     if (!r.ok) throw new Error(data.error || '请求失败');
     return data;
   },
 };
+
+// ---------- 身份 / 登录门 ----------
+let ME = { name: '', isOwner: false }; // 当前用户（/api/state 带回）
+
+function showAuthGate(msg) {
+  const gate = $('#auth-gate');
+  if (!gate || !gate.classList.contains('hidden')) return;
+  gate.classList.remove('hidden');
+  document.body.classList.add('locked');
+  if (msg) $('#auth-err').textContent = msg;
+  setTimeout(() => $('#auth-code')?.focus(), 50);
+}
+function hideAuthGate() {
+  $('#auth-gate')?.classList.add('hidden');
+  document.body.classList.remove('locked');
+}
+
+function applyMe(user) {
+  ME = { name: user.name || '', isOwner: Boolean(user.is_owner) };
+  const chip = $('#user-chip');
+  if (chip) { chip.hidden = false; chip.textContent = (ME.isOwner ? '👑 ' : '') + ME.name; }
+  const lb = $('#logout-btn');
+  if (lb) lb.hidden = false;
+  const nav = $('#nav-admin');
+  if (nav) nav.hidden = !ME.isOwner;
+}
+
+async function initAuth() {
+  // 先问"要不要引导"（公开接口），再决定登录门的提示语
+  let boot = false;
+  try { boot = Boolean((await api.get('/api/auth/status')).needBootstrap); } catch { /* 忽略 */ }
+  const tip = $('#auth-tip');
+  if (boot) tip.innerHTML = '这个站点还没有<b>站长</b>——直接点「进入」，你就是站长（之后可在「管理」页生成邀请码发给朋友）。<br>也可以在服务器 .env 里配置 <code>OWNER_CODE</code> 限定引导码。';
+  // 尝试用已有 cookie 直接进入
+  try {
+    const s = await api.get('/api/state');
+    if (s.me) { applyMe(s.me); hideAuthGate(); return s; }
+  } catch { /* 401 正常：showAuthGate 已被 api 调用 */ }
+  return null;
+}
+
+async function bindAuthGate(onOk) {
+  const join = async () => {
+    const code = $('#auth-code').value.trim();
+    const name = $('#auth-name').value.trim();
+    const err = $('#auth-err');
+    const btn = $('#auth-join');
+    err.textContent = '';
+    btn.disabled = true;
+    btn.textContent = '进入中…';
+    try {
+      const r = await fetch('/api/auth/join', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code, name }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || '进入失败');
+      applyMe(data.user);
+      hideAuthGate();
+      toast(data.user.isOwner ? '你是站长 ✅ 去「管理」页生成邀请码发给朋友' : '欢迎！你的练习数据只有你自己可见');
+      if (onOk) onOk();
+    } catch (e2) {
+      err.textContent = e2.message;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '进入';
+    }
+  };
+  $('#auth-join').addEventListener('click', join);
+  $('#auth-code').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#auth-name').focus(); });
+  $('#auth-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') join(); });
+  $('#logout-btn').addEventListener('click', async () => {
+    try { await fetch('/api/auth/logout', { method: 'POST' }); } catch { /* */ }
+    location.reload();
+  });
+}
 
 function toast(msg) {
   const t = $('#toast');
@@ -84,7 +164,7 @@ const session = { id: null, card: null, turns: [], busy: false };
 const RETELL_SECONDS = 90;
 
 // ---------- 路由 ----------
-const NAV_GROUP = { home: 'practice', practice: 'practice', speech: 'speech', cards: 'material', bookshelf: 'reading', interview: 'interview', books: 'library', words: 'words', history: 'history' };
+const NAV_GROUP = { home: 'practice', practice: 'practice', speech: 'speech', cards: 'material', bookshelf: 'reading', interview: 'interview', books: 'library', words: 'words', history: 'history', admin: 'admin' };
 function router() {
   const parts = (location.hash.replace(/^#\/?/, '') || 'home').split('/');
   const hash = parts[0];
@@ -98,7 +178,7 @@ function router() {
   app.innerHTML = '';
   app.className = '';
   if (hash === 'cards') { cards(app, parts[1] || 'ted'); return; }
-  const views = { home, practice, speech, bookshelf, interview, books, history, words };
+  const views = { home, practice, speech, bookshelf, interview, books, history, words, admin };
   (views[hash] || home)(app);
 }
 window.addEventListener('hashchange', router);
@@ -106,9 +186,11 @@ window.addEventListener('hashchange', router);
 async function refreshBadge() {
   try {
     const s = await api.get('/api/state');
+    if (s.me) applyMe(s.me);
     const n = $('#streak-num');
     if (n) n.textContent = s.streak;
-  } catch { /* 忽略 */ }
+    return s;
+  } catch { return null; }
 }
 
 // 进入练习页仅先载入素材；会话（历史记录）延迟到「开始复述」时才创建
@@ -824,12 +906,12 @@ async function cards(root, sub = 'ted') {
       ${items.map((c) => `
         <li class="card-row">
           <div class="card-info">
-            <b>${esc(c.title)}</b>
+            <b>${esc(c.title)}</b>${c.scope === 'mine' ? '<span class="scope-badge mine">我的</span>' : '<span class="scope-badge">公共</span>'}
             <span class="dim">${materialDate(c.published_at)} · ${c.content.length} 字${lenBadge(c.content.length)} · ${sourceHtml(c.source)}${c.used_at ? ' · 练过' : ' · 未练'}</span>
           </div>
           <div class="row-actions">
             <button class="practice-btn" data-id="${c.id}">直接练</button>
-            <button class="ghost del-btn" data-id="${c.id}" data-title="${esc(c.title)}">删除</button>
+            ${c.scope === 'mine' ? `<button class="ghost del-btn" data-id="${c.id}" data-title="${esc(c.title)}">删除</button>` : ''}
           </div>
         </li>`).join('') || `<li class="dim">「${esc(catMeta.name)}」还没有素材${cat === 'rmrb' ? '，点上面按钮抓取今日评论' : cat === 'short' ? '，点上面按钮抓取每日短评' : cat === 'story' ? '，点上面按钮立即抓取订阅源' : cat === 'video' ? '，把抖音/小红书分享文案粘到上面，点「解析」' : '，粘贴一个 TED 演讲链接导入'}</li>`}
     </ul>`;
@@ -2444,6 +2526,75 @@ async function words(root) {  root.innerHTML = '<div class="loading">加载中�
     </div>`;
 }
 
+// ---------- 站长管理页 ----------
+async function admin(root) {
+  if (!ME.isOwner) { root.innerHTML = '<div class="empty">只有站长可以进管理页。</div>'; return; }
+  root.innerHTML = '<div class="loading">读取中…</div>';
+  let data;
+  try {
+    data = await api.get('/api/admin/overview');
+  } catch (err) {
+    root.innerHTML = `<div class="empty">${esc(err.message)}</div>`;
+    return;
+  }
+  const users = data.users || [];
+  const codes = data.codes || [];
+  const userNames = {};
+  users.forEach((u) => { userNames[u.uid] = u.name; });
+  root.innerHTML = `
+    <h2>管理</h2>
+    <div class="admin-grid">
+      <section class="admin-card">
+        <h3>邀请码 <span class="count">${codes.filter((c) => !c.revoked && !c.used_by).length} 个可用</span></h3>
+        <p class="dim">发给朋友，对方首次输入即自动建号；一个码只能用一次。停用后未使用的码作废（已建的用户不受影响）。</p>
+        <div class="gen-row">
+          <input id="code-label" placeholder="备注（如：给小李）" maxlength="30" />
+          <button id="code-new" class="primary">${iconBtn(ICONS.plus, '生成邀请码')}</button>
+        </div>
+        <ul class="code-list">
+          ${codes.map((c) => `
+            <li class="code-row ${c.used_by ? 'used' : ''} ${c.revoked ? 'revoked' : ''}">
+              <code>${esc(c.code)}</code>
+              <span class="dim">${esc(c.label || '')}${c.used_by ? ` · 已被「${esc(userNames[c.used_by] || '某人')}」使用` : ''}${c.revoked ? ' · 已停用' : ''}</span>
+              ${(!c.used_by && !c.revoked) ? `<button class="ghost small revoke-code" data-code="${esc(c.code)}">停用</button>` : ''}
+            </li>`).join('') || '<li class="dim">还没有邀请码，点上面生成一个。</li>'}
+        </ul>
+      </section>
+      <section class="admin-card">
+        <h3>用户 <span class="count">${users.length} 人</span></h3>
+        <p class="dim">每人一套独立数据（练习记录 / 词库 / 划线 / 素材 / 上传的书），互相完全看不到。</p>
+        <ul class="user-list">
+          ${users.map((u) => `
+            <li class="user-row">
+              <b>${u.is_owner ? '👑 ' : ''}${esc(u.name)}</b>
+              <span class="dim">练过 ${u.sessions} 次 · 词库 ${u.words} 条 · 最近 ${esc((u.last_seen || '从未').slice(0, 16))}</span>
+              ${u.is_owner ? '<span class="dim">（你自己）</span>' : `<button class="ghost small revoke-user" data-uid="${esc(u.uid)}">踢下线</button>`}
+            </li>`).join('')}
+        </ul>
+      </section>
+    </div>`;
+  $('#code-new')?.addEventListener('click', async () => {
+    const btn = $('#code-new');
+    btn.disabled = true;
+    try {
+      const r = await api.post('/api/admin/codes', { label: $('#code-label').value.trim() });
+      toast(`新邀请码：${r.code}（发给朋友即可）`);
+      admin(root);
+    } catch (err) { toast(err.message); } finally { btn.disabled = false; }
+  });
+  root.querySelectorAll('.revoke-code').forEach((b) => b.addEventListener('click', async () => {
+    if (!confirm(`停用邀请码 ${b.dataset.code}？`)) return;
+    try { await api.post('/api/admin/codes/revoke', { code: b.dataset.code }); admin(root); } catch (err) { toast(err.message); }
+  }));
+  root.querySelectorAll('.revoke-user').forEach((b) => b.addEventListener('click', async () => {
+    if (!confirm('把这位用户踢下线？（他的数据不会被删，只是要重新输入邀请码登录）')) return;
+    try { await api.post(`/api/admin/users/${b.dataset.uid}/revoke`, {}); toast('已踢下线'); admin(root); } catch (err) { toast(err.message); }
+  }));
+}
+
 // ---------- 启动 ----------
-router();
-refreshBadge();
+(async function boot() {
+  await bindAuthGate(() => { router(); refreshBadge(); });
+  const s = await initAuth();
+  if (s) { router(); refreshBadge(); }
+})();

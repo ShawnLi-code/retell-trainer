@@ -7,15 +7,23 @@ const crypto = require('node:crypto');
 const AdmZip = require('adm-zip');
 const { DOMParser } = require('@xmldom/xmldom');
 
-const ROOT = path.resolve(process.env.BOOKS_DIR || path.join(__dirname, 'data', 'books'));
+const ctx = require('./ctx');
+const DATA_BASE = path.join(__dirname, 'data');
+const BOOKS_BASE = path.resolve(process.env.BOOKS_DIR || path.join(DATA_BASE, 'books'));
+const IMG_BASE = path.join(DATA_BASE, 'imgs'); // 图片缓存：PDF 页面渲染 / epub 内嵌图（按用户分目录）
+const EPUB_BASE = path.join(DATA_BASE, 'epubs'); // PDF→EPUB 转换缓存（按用户分目录）
 const IGNORE_DIR = /node_modules|\.dsh|harness|video|model|\.git|\.omo|extract_books|assets?/i;
 const BOOK_EXTS = ['.epub', '.pdf', '.docx', '.txt', '.md', '.mobi', '.azw3'];
 const CHUNK = 2000; // 无章节结构的文本按此字数切章
-const IMG_DIR = path.join(__dirname, 'data', 'imgs'); // 图片缓存：PDF 页面渲染 / epub 内嵌图
 const PDF_SCALE = 2; // PDF 页渲染倍率（页图 PNG 与透明文字层共用，改这里需清 data/imgs/pdf 缓存）
 let mupdfDoc = null; // 当前打开的 PDF 文档（懒加载）
 
-fs.mkdirSync(ROOT, { recursive: true });
+// ---------- 多用户：书库 / 缓存目录按当前请求用户自动分目录（一人一库物理隔离） ----------
+const userSeg = () => { const uid = ctx.currentUid(); return uid ? String(uid).replace(/[^a-zA-Z0-9_-]/g, '') : '_shared'; };
+const subDir = (base) => { const d = path.join(base, userSeg()); fs.mkdirSync(d, { recursive: true }); return d; };
+const rootDir = () => subDir(BOOKS_BASE);
+const imgDir = () => subDir(IMG_BASE);
+const epubDir = () => subDir(EPUB_BASE);
 
 // zip 内路径归一化（防穿越 + 统一斜杠）
 const normPath = (p) => path.posix.normalize(('/' + String(p || '').replace(/\\/g, '/').replace(/^\/+/, '')).replace(/\/+/g, '/')).replace(/^\/+/, '');
@@ -35,7 +43,7 @@ function cleanTitle(name) {
 // ---------- 扫描 ----------
 function scanBooks() {
   const books = [];
-  if (!fs.existsSync(ROOT)) return books;
+  const ROOT = rootDir();
   const defs = [];
 
   for (const entry of fs.readdirSync(ROOT, { withFileTypes: true })) {
@@ -91,6 +99,7 @@ function importEpub(buffer, originalName) {
     .replace(/[. ]+$/g, '')
     .trim() || '未命名图书';
   let filename = `${safeBase}.epub`;
+  const ROOT = rootDir();
   let target = path.join(ROOT, filename);
   let copy = 2;
 
@@ -122,6 +131,7 @@ function importPdf(buffer, originalName) {
     .replace(/[. ]+$/g, '')
     .trim() || '未命名图书';
   let filename = `${safeBase}.pdf`;
+  const ROOT = rootDir();
   let target = path.join(ROOT, filename);
   let copy = 2;
 
@@ -202,10 +212,11 @@ function byNameNum(a, b) {
 }
 
 // ---------- 解析缓存 ----------
-const cache = new Map(); // id -> { mtimeMs, book: {title, author, chapters, cover} }
+const cache = new Map(); // uid::id -> { mtimeMs, book } —— key 带用户段，两人传同名书也不串
 
 function cached(id, loader) {
-  const hit = cache.get(id);
+  const key = userSeg() + '::' + id;
+  const hit = cache.get(key);
   if (hit) {
     try {
       const m = fs.statSync(hit.file).mtimeMs;
@@ -213,7 +224,7 @@ function cached(id, loader) {
     } catch { /* 文件没了，重新解析 */ }
   }
   const book = loader();
-  cache.set(id, { file: hit?.file, mtimeMs: hit?.mtimeMs, book });
+  cache.set(key, { file: hit?.file, mtimeMs: hit?.mtimeMs, book });
   return book;
 }
 
@@ -293,7 +304,7 @@ function parseEpub(file, id) {
       const buf = zip.readFile(full);
       const ext = path.extname(full).slice(1).toLowerCase() || 'jpg';
       const key = idOf(full) + '_' + ext;
-      const fp = path.join(IMG_DIR, 'epub', id, 'i' + key);
+      const fp = path.join(imgDir(), 'epub', id, 'i' + key);
       fs.mkdirSync(path.dirname(fp), { recursive: true });
       if (!fs.existsSync(fp)) fs.writeFileSync(fp, buf);
       return `\u0002I:${key}\u0002`;
@@ -660,6 +671,7 @@ function findBook(id) {
 }
 
 function findDef(id) {
+  const ROOT = rootDir();
   for (const entry of fs.readdirSync(ROOT, { withFileTypes: true })) {
     const full = path.join(ROOT, entry.name);
     if (entry.isDirectory()) {
@@ -684,6 +696,7 @@ async function getBook(id) {
 
 // 从书架删除：删书文件（顶层文件直接删；单书目录整目录删；多书目录只删本文件）+ 转换缓存
 function removeBook(id) {
+  const ROOT = rootDir();
   const def = findDef(id);
   if (!def || !def.file) return { ok: false, error: '没找到这本书' };
   const parent = path.dirname(def.file);
@@ -697,7 +710,7 @@ function removeBook(id) {
       try { fs.unlinkSync(def.file); } catch (err) { if (err.code !== 'ENOENT') return { ok: false, error: '删除文件失败：' + err.message }; }
     }
   }
-  const cacheDir = path.join(__dirname, 'data', 'epubs');
+  const cacheDir = epubDir();
   if (fs.existsSync(cacheDir)) {
     for (const f of fs.readdirSync(cacheDir)) {
       if (f.startsWith(id + '.')) { try { fs.unlinkSync(path.join(cacheDir, f)); } catch { /* 缓存删除失败无碍 */ } }
@@ -744,7 +757,7 @@ async function openMupdf(file) {
 
 // PDF 页数 + 每页渲染像素尺寸（磁盘缓存，前端滚动容器用 aspect-ratio 预占位，避免布局跳动）
 async function pdfInfo(def) {
-  const fp = path.join(IMG_DIR, 'pdf', def.id, 'info.json');
+  const fp = path.join(imgDir(), 'pdf', def.id, 'info.json');
   try {
     const st = fs.statSync(def.file);
     if (fs.existsSync(fp)) {
@@ -822,7 +835,7 @@ async function correctOutlinePages(def, items) {
 async function pagePng(id, n1) { // n1: 1-based 页码
   const def = findDef(id);
   if (!def || !def.file.toLowerCase().endsWith('.pdf')) return null;
-  const fp = path.join(IMG_DIR, 'pdf', id, `p${n1}.png`);
+  const fp = path.join(imgDir(), 'pdf', id, `p${n1}.png`);
   if (fs.existsSync(fp)) return fs.readFileSync(fp);
   const { mupdf, doc } = await openMupdf(def.file);
   const page = doc.loadPage(n1 - 1);
@@ -838,7 +851,7 @@ async function pagePng(id, n1) { // n1: 1-based 页码
 async function pageStructuredText(id, n1) {
   const def = findDef(id);
   if (!def || !def.file.toLowerCase().endsWith('.pdf')) return null;
-  const fp = path.join(IMG_DIR, 'pdf', id, `p${n1}.json`);
+  const fp = path.join(imgDir(), 'pdf', id, `p${n1}.json`);
   if (fs.existsSync(fp)) return JSON.parse(fs.readFileSync(fp, 'utf8'));
   const { doc } = await openMupdf(def.file);
   const page = doc.loadPage(n1 - 1);
@@ -876,7 +889,7 @@ async function pageStructuredText(id, n1) {
 }
 
 function getBookImg(id, key) { // key: md5_ext
-  const fp = path.join(IMG_DIR, 'epub', id, 'i' + key);
+  const fp = path.join(imgDir(), 'epub', id, 'i' + key);
   if (!fs.existsSync(fp)) return null;
   const ext = key.split('_').pop() || 'jpg';
   const type = ({ jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml' })[ext] || 'image/jpeg';
@@ -1072,7 +1085,7 @@ function writeEpubZip(entries, outFile) {
 
 async function convertPdfToEpub(def) {
   const CONV_VERSION = 5; // 启发式规则调整时递增，失效旧缓存
-  const outDir = path.join(__dirname, 'data', 'epubs');
+  const outDir = epubDir();
   fs.mkdirSync(outDir, { recursive: true });
   const outFile = path.join(outDir, def.id + '.epub');
   const metaFile = outFile + '.json';
@@ -1197,7 +1210,7 @@ async function convertPdfToEpub(def) {
 function epubFileOf(def) {
   if (!def) return null;
   if (def.file.toLowerCase().endsWith('.epub')) return def.file;
-  const f = path.join(__dirname, 'data', 'epubs', def.id + '.epub');
+  const f = path.join(epubDir(), def.id + '.epub');
   return fs.existsSync(f) ? f : null;
 }
 
@@ -1358,4 +1371,4 @@ function getRes(id, p) {
   } catch { return null; }
 }
 
-module.exports = { scanBooks, importEpub, importPdf, removeBook, getBook, getCover, pagePng, pageStructuredText, getBookImg, getChapterRaw, getRawAll, getSpineContent, getRes, ROOT };
+module.exports = { scanBooks, importEpub, importPdf, removeBook, getBook, getCover, pagePng, pageStructuredText, getBookImg, getChapterRaw, getRawAll, getSpineContent, getRes, rootDir };

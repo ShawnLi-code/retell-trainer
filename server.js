@@ -6,6 +6,8 @@ const os = require('node:os');
 const { execFile } = require('node:child_process');
 const { randomUUID } = require('node:crypto');
 const db = require('./db');
+const ctx = require('./ctx');
+const auth = require('./auth');
 const { chat, parseJson, isConfigured, healthCheck } = require('./llm');
 const prompts = require('./prompts');
 const { fetchAndImport, reprocessFeedCards, getFeedHealth, importTed, importRmrb, importDailyShort, importShort } = require('./fetch_cards');
@@ -79,10 +81,82 @@ app.use(express.static(path.join(__dirname, 'public')));
 // 追问轮数上限（用户发言次数达到该值后强制收尾）
 const MAX_TURNS = 6;
 
+// ---------- 鉴权：全站 /api 锁在登录门后（除 /api/auth/*）；请求作用域切到当前用户 ----------
+const PUBLIC_API = new Set(['/api/auth/join', '/api/auth/logout', '/api/auth/status']);
+app.use('/api', (req, res, next) => {
+  const pathOnly = (req.originalUrl || req.url).split('?')[0];
+  if (PUBLIC_API.has(pathOnly)) return next();
+  const user = auth.readAuth(req);
+  if (!user) return res.status(401).json({ error: '请先输入邀请码', needAuth: true });
+  req.user = user;
+  // 之后本请求内所有同步/异步的 db / bookshelf / interview 调用都自动落到这个用户的库
+  return ctx.runWith({ scope: 'user', uid: user.uid, isOwner: Boolean(user.is_owner) }, next);
+});
+
 // ---------- 状态 ----------
+app.get('/health', (_req, res) => res.json({ ok: true }));
+app.get('/api/auth/status', (_req, res) => {
+  // 此路由在鉴权白名单内：返回"我是谁/要不要引导"，不泄露任何数据
+  res.json({ needBootstrap: auth.isBootstrapNeeded() });
+});
+
+app.post('/api/auth/join', (req, res) => {
+  const code = String((req.body || {}).code || '').trim();
+  const name = String((req.body || {}).name || '').trim();
+  const r = auth.join(code, name);
+  if (!r.ok) return res.status(400).json({ error: r.error });
+  const token = auth.createSession(r.uid);
+  auth.setSessionCookie(res, token, isHttpsReq(req));
+  const u = auth.getUser(r.uid);
+  res.json({ ok: true, user: { uid: r.uid, name: u ? u.name : '', isOwner: r.isOwner } });
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  const u = auth.readAuth(req);
+  if (u) auth.dropSessions(u.uid);
+  auth.clearSessionCookie(res, isHttpsReq(req));
+  res.json({ ok: true });
+});
+
+// ---------- 站长管理页 ----------
+function isHttpsReq(req) {
+  const proto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+  if (proto === 'https') return true;
+  return !/^(localhost|127\.|\[::1\]|.+:\d+$)/.test(String(req.headers.host || ''));
+}
+
+function requireOwner(req, res, next) {
+  if (!req.user || !req.user.is_owner) return res.status(403).json({ error: '只有站长可以操作' });
+  next();
+}
+
+app.get('/api/admin/overview', requireOwner, (_req, res) => {
+  res.json({ users: auth.listUsersWithStats(), codes: auth.listInviteCodes() });
+});
+
+app.post('/api/admin/codes', requireOwner, (req, res) => {
+  const code = auth.createInviteCode(String((req.body || {}).label || '').trim(), req.user.uid);
+  res.json({ code });
+});
+
+app.post('/api/admin/codes/revoke', requireOwner, (req, res) => {
+  const ok = auth.revokeInviteCode(String((req.body || {}).code || ''));
+  res.json({ ok });
+});
+
+// 停用某用户：踢下线（删其全部登录令牌）。不删数据——文件都还在，想彻底清除站长手动删库文件。
+app.post('/api/admin/users/:uid/revoke', requireOwner, (req, res) => {
+  const u = auth.getUser(req.params.uid);
+  if (!u) return res.status(404).json({ error: '用户不存在' });
+  if (u.is_owner) return res.status(400).json({ error: '不能停用自己' });
+  auth.dropSessions(u.uid);
+  res.json({ ok: true, name: u.name });
+});
+
 app.get('/api/state', (req, res) => {
   const day = db.localDayKey();
   res.json({
+    me: { name: req.user.name, isOwner: Boolean(req.user.is_owner) },
     todayCard: db.getTodayCard(day),
     practicedToday: db.practicedOn(day),
     streak: db.calcStreak(),
@@ -109,7 +183,8 @@ app.delete('/api/cards/:id', (req, res) => {
   if (!id) return res.status(400).json({ error: '参数不对' });
   const card = db.getCard(id);
   if (!card) return res.status(404).json({ error: '素材不存在' });
-  db.deleteCard(id);
+  if (card.owner_uid == null) return res.status(403).json({ error: '公共素材大家共用，删不了哦' });
+  if (!db.deleteCard(id)) return res.status(403).json({ error: '只能删除自己导入的素材' });
   res.json({ ok: true });
 });
 
@@ -160,7 +235,17 @@ app.post('/api/practice/transcribe',
   });
 
 // ---------- 语料抓取 ----------
-app.post('/api/cards/fetch-rmrb', async (req, res) => {
+// 刷新"公共池"的抓取（人民日报/每日短评/RSS/整理）会写共享素材并消耗站长 LLM 额度：
+// 只允许站长触发，且跑在 shared 作用域（写成公共卡 owner_uid=NULL，大家都能练）。
+// 个人粘贴导入（import-short / fetch-ted）走当前用户请求作用域 → 私有素材。
+function sharedAdmin(fn) {
+  return (req, res) => {
+    if (!req.user || !req.user.is_owner) return res.status(403).json({ error: '公共素材刷新只有站长可以操作' });
+    return ctx.runWith({ scope: 'shared', uid: null, isOwner: true }, () => fn(req, res));
+  };
+}
+
+app.post('/api/cards/fetch-rmrb', sharedAdmin(async (req, res) => {
   try {
     const { added, skipped } = await importRmrb({ onLog: (s) => console.log('[rmrb]', s) });
     res.json({ added: added.length, skipped: skipped.length });
@@ -168,10 +253,10 @@ app.post('/api/cards/fetch-rmrb', async (req, res) => {
     console.error('[rmrb error]', err.message);
     res.status(502).json({ error: err.message });
   }
-});
+}));
 
 // 每日短评（人民网观点频道）
-app.post('/api/cards/fetch-short', async (req, res) => {
+app.post('/api/cards/fetch-short', sharedAdmin(async (req, res) => {
   try {
     const { added, skipped } = await importDailyShort({ onLog: (s) => console.log('[short]', s) });
     res.json({ added: added.length, skipped: skipped.length });
@@ -179,7 +264,7 @@ app.post('/api/cards/fetch-short', async (req, res) => {
     console.error('[short error]', err.message);
     res.status(502).json({ error: err.message });
   }
-});
+}));
 
 // 粘贴/URL 导入短评素材
 app.post('/api/cards/import-short', async (req, res) => {
@@ -206,7 +291,7 @@ app.post('/api/cards/fetch-ted', async (req, res) => {
 });
 
 // RSS/Atom 订阅源：手动立即抓取（自动任务每天也会调用同一流程）
-app.post('/api/cards/fetch-rss', async (req, res) => {
+app.post('/api/cards/fetch-rss', sharedAdmin(async (req, res) => {
   const maxPerFeed = Math.max(1, Math.min(5, Number(req.body?.maxPerFeed) || 1));
   const maxTotal = Math.max(1, Math.min(20, Number(req.body?.maxTotal) || 6));
   try {
@@ -220,9 +305,9 @@ app.post('/api/cards/fetch-rss', async (req, res) => {
     console.error('[rss error]', err.message);
     res.status(502).json({ error: err.message });
   }
-});
+}));
 
-app.post('/api/cards/reprocess-rss', async (_req, res) => {
+app.post('/api/cards/reprocess-rss', sharedAdmin(async (_req, res) => {
   try {
     const result = await reprocessFeedCards({ onLog: (s) => console.log('[rss 整理]', s) });
     res.json({ updated: result.updated.length, skipped: result.skipped.length, details: result.skipped });
@@ -230,7 +315,7 @@ app.post('/api/cards/reprocess-rss', async (_req, res) => {
     console.error('[rss reprocess error]', err.message);
     res.status(502).json({ error: err.message });
   }
-});
+}));
 
 // 订阅源健康状态（进程重启后会重新从 never 开始，下一次抓取会填充）
 app.get('/api/feeds/health', (req, res) => {
@@ -390,7 +475,7 @@ app.get('/api/words', (req, res) => {
 app.get('/api/bookshelf', (req, res) => {
   let books = [];
   try { books = shelf.scanBooks(); } catch (err) { return res.status(500).json({ error: '书架扫描失败：' + err.message }); }
-  res.json({ books, dir: shelf.ROOT });
+  res.json({ books, dir: shelf.rootDir() });
 });
 
 app.post('/api/bookshelf/upload', express.raw({
@@ -604,6 +689,13 @@ app.post('/api/interview/practice/:id/restate', async (req, res) => {
   catch (error) { res.status(/不存在/.test(error.message) ? 404 : 409).json({ error: error.message }); }
 });
 
+// ---------- 共享素材维护（写公共库 shared.db，仅站长） ----------
+// 系统抓取来的素材是全站共用的，落 shared 作用域（owner_uid=NULL）；
+// 用户自己粘贴/解析的素材走各自请求作用域（owner_uid=本人），天然私有。
+function runShared(fn) {
+  return (req, res) => ctx.runWith({ scope: 'shared', uid: null, isOwner: true }, () => fn(req, res));
+}
+
 // 每日自动抓 RSS 订阅源 + 人民日报评论版 + 每日短评（启动 5 分钟后 + 每 24 小时）
 let autoFetchedDay = '';
 let autoFetchRunning = false;
@@ -611,24 +703,26 @@ async function autoFetch() {
   const day = db.localDayKey();
   if (autoFetchedDay === day || autoFetchRunning) return; // 今天已抓过/正在抓
   autoFetchRunning = true;
-  try {
-    const jobs = [
-      ['RSS 订阅源', () => fetchAndImport({ maxPerFeed: 1, maxTotal: 6, onLog: (s) => console.log('[自动抓RSS]', s) })],
-      ['人民日报评论版', importRmrb],
-      ['每日短评', importDailyShort],
-    ];
-    for (const [name, fn] of jobs) {
-      try {
-        const { added, skipped } = await fn({ onLog: (s) => console.log(`[自动抓${name}]`, s) });
-        console.log(`[自动抓${name}] 新增 ${added.length} 条，跳过 ${skipped.length} 条`);
-      } catch (err) {
-        console.error(`[自动抓${name}失败]`, err.message);
+  await ctx.runWith({ scope: 'shared', uid: null, isOwner: true }, async () => {
+    try {
+      const jobs = [
+        ['RSS 订阅源', () => fetchAndImport({ maxPerFeed: 1, maxTotal: 6, onLog: (s) => console.log('[自动抓RSS]', s) })],
+        ['人民日报评论版', importRmrb],
+        ['每日短评', importDailyShort],
+      ];
+      for (const [name, fn] of jobs) {
+        try {
+          const { added, skipped } = await fn({ onLog: (s) => console.log(`[自动抓${name}]`, s) });
+          console.log(`[自动抓${name}] 新增 ${added.length} 条，跳过 ${skipped.length} 条`);
+        } catch (err) {
+          console.error(`[自动抓${name}失败]`, err.message);
+        }
       }
+      autoFetchedDay = day;
+    } finally {
+      autoFetchRunning = false;
     }
-    autoFetchedDay = day;
-  } finally {
-    autoFetchRunning = false;
-  }
+  });
 }
 
 const PORT = Number(process.env.PORT) || 3025;
@@ -857,9 +951,16 @@ function pumpLinkQueue() {
   const job = linkQueue.shift();
   if (!job) { linkRunning = false; return; }
   linkRunning = true;
-  runLinkTask(job.id, job.url).finally(() => {
-    linkRunning = false;
-    pumpLinkQueue();
+  // 任务是响应之后才跑的，请求作用域（AsyncLocalStorage）早已退出
+  // → 必须显式把提交者的 uid 重新包进上下文，否则落库会落到别人/共享库里
+  ctx.runWith({ scope: 'user', uid: job.uid, isOwner: Boolean(job.isOwner) }, () => {
+    Promise.resolve()
+      .then(() => runLinkTask(job.id, job.url))
+      .catch((err) => console.error('[链接任务异常]', job.id, err.message))
+      .finally(() => {
+        linkRunning = false;
+        pumpLinkQueue();
+      });
   });
 }
 
@@ -886,7 +987,7 @@ app.post('/api/material/link', (req, res) => {
   // 同链接已有进行中任务：复用，避免重复提交产生两个任务（两个进度条）
   const activeId = db.findActiveTaskByUrl(url);
   if (activeId) return res.json({ taskId: activeId, cached: true, active: true });
-  const task = { id: randomUUID().slice(0, 8), url, host: classifyPlatform(url) };
+  const task = { id: randomUUID().slice(0, 8), url, host: classifyPlatform(url), uid: req.user.uid, isOwner: Boolean(req.user.is_owner) };
   db.createLinkTask(task);
   linkQueue.push(task);
   pumpLinkQueue();
@@ -1002,3 +1103,5 @@ if (process.env.WEBHOOK_SECRET) {
 // 启动 5 分钟后再跑第一次自动抓料（给服务喘口气），之后每天一次
 setTimeout(autoFetch, 5 * 60 * 1000);
 setInterval(autoFetch, 24 * 60 * 60 * 1000);
+// 登录令牌每小时清一次过期记录
+setInterval(() => { try { auth.gcSessions(); } catch { /* */ } }, 60 * 60 * 1000);

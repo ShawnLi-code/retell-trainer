@@ -4,9 +4,16 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { chat, parseJson, isConfigured } = require('./llm');
+const ctx = require('./ctx');
 
 const SOURCE_ROOT = path.resolve(process.env.INTERVIEW_BANK_DIR || path.join(__dirname, 'interview-bank'));
-const RECORDS_FILE = path.join(__dirname, 'data', 'interview-records.json');
+// 面试记录按用户分文件（物理隔离）；无用户作用域（系统内部）落 _shared
+const RECORDS_BASE = path.join(__dirname, 'data', 'interview-records');
+const recordsFile = () => {
+  const uid = ctx.currentUid();
+  const seg = uid ? String(uid).replace(/[^a-zA-Z0-9_-]/g, '') : '_shared';
+  return path.join(RECORDS_BASE, seg + '.json');
+};
 const QUESTION_DIRS = { interview: '面试题库', real: '企业真题' };
 const recordsLock = { busy: false };
 let questionCache = { signature: '', questions: [] };
@@ -97,18 +104,20 @@ function publicQuestion(question, includeAnswer = false) {
 }
 
 function readRecords() {
-  if (!fs.existsSync(RECORDS_FILE)) return [];
+  const file = recordsFile();
+  if (!fs.existsSync(file)) return [];
   try {
-    const value = JSON.parse(fs.readFileSync(RECORDS_FILE, 'utf8'));
+    const value = JSON.parse(fs.readFileSync(file, 'utf8'));
     return Array.isArray(value) ? value : [];
   } catch { return []; }
 }
 
 function writeRecords(records) {
-  fs.mkdirSync(path.dirname(RECORDS_FILE), { recursive: true });
-  const temp = `${RECORDS_FILE}.tmp`;
+  const file = recordsFile();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const temp = `${file}.tmp`;
   fs.writeFileSync(temp, JSON.stringify(records, null, 2), 'utf8');
-  fs.renameSync(temp, RECORDS_FILE);
+  fs.renameSync(temp, file);
 }
 
 function now() { return new Date().toISOString(); }
