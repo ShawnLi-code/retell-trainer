@@ -231,9 +231,10 @@ async function renderLinkTasks(root) {
           : '<span class="dim">已存入素材库 ✅</span>')
         : `<button class="primary lt-save" data-id="${t.id}">📥 存入素材库</button>`)
       : (t.status === 'failed' ? '<span class="dim">重新粘贴链接即可重试</span>' : '');
+    const canDel = t.status === 'done' || t.status === 'failed';
     return `
       <div class="lt-row ${t.status}">
-        <div class="lt-head"><b>${esc(title)}</b><span class="lt-badge">${taskBadge(t.host)}</span></div>
+        <div class="lt-head"><b>${esc(title)}</b><span class="lt-right"><span class="lt-badge">${taskBadge(t.host)}</span>${canDel ? `<button class="lt-del" data-id="${t.id}" title="删除这条解析记录">×</button>` : ''}</span></div>
         <div class="lt-bar ${barCls}"><i style="width:${t.pct || (t.status === 'done' ? 100 : 5)}%"></i></div>
         <div class="lt-sub">${statusLine}<span class="dim"> · ${esc(t.created_at || '')}</span></div>
         ${action ? `<div class="lt-action">${action}</div>` : ''}
@@ -261,11 +262,22 @@ async function renderLinkTasks(root) {
       try {
         const r = await api.post(`/api/material/link/${btn.dataset.id}/reformat`, {});
         toast(`整理完成，共 ${r.length} 字，去「直接练」试试`);
-        renderLinkTasks(root);
-      } catch (err) {
+        renderLinkTasks(root);      } catch (err) {
         toast(err.message);
         btn.disabled = false;
         btn.textContent = '✨ AI 整理格式';
+      }
+    });
+  });
+  box.querySelectorAll('.lt-del').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      if (!confirm('删除这条解析记录？（不影响已存入的素材）')) return;
+      try {
+        await api.del(`/api/material/link/${btn.dataset.id}`);
+        toast('已删除');
+        renderLinkTasks(root);
+      } catch (err) {
+        toast('删除失败：' + err.message);
       }
     });
   });

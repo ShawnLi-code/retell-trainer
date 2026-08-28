@@ -894,6 +894,13 @@ app.get('/api/material/link/tasks', (req, res) => {
   });
 });
 
+// 删除一条解析记录（只删任务日志，不影响已存入的素材卡）
+app.delete('/api/material/link/:id', (req, res) => {
+  const ok = db.deleteLinkTask(req.params.id);
+  if (!ok) return res.status(404).json({ error: '记录不存在' });
+  res.json({ ok: true });
+});
+
 app.get('/api/material/link/:id', (req, res) => {
   const t = db.getLinkTask(req.params.id);
   if (!t) return res.status(404).json({ error: '任务不存在' });

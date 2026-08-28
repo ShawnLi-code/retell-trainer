@@ -304,6 +304,12 @@ function findDoneTaskByUrl(url) {
   return row ? row.id : null;
 }
 
+const deleteLinkTaskStmt = db.prepare(`DELETE FROM link_tasks WHERE id = ?`);
+
+function deleteLinkTask(id) {
+  return deleteLinkTaskStmt.run(id).changes > 0;
+}
+
 // ---------- stats ----------
 function totalSessions() {
   return Number(db.prepare(`SELECT COUNT(*) AS n FROM sessions`).get().n);
@@ -340,5 +346,6 @@ module.exports = {
   getLinkTask,
   listLinkTasks,
   findDoneTaskByUrl,
+  deleteLinkTask,
   totalSessions,
 };

@@ -1452,3 +1452,15 @@ main.interview-wrap { max-width: 980px; }
 .lt-sub .dim { font-size: 12px; }
 .lt-action { margin-top: 8px; }
 .lt-action .primary { padding: 6px 14px; font-size: 13px; }
+.lt-right { display: flex; align-items: center; gap: 6px; }
+.lt-del {
+  border: none;
+  background: none;
+  color: var(--ink-dim);
+  font-size: 16px;
+  line-height: 1;
+  padding: 2px 7px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.lt-del:hover { color: #b3402e; background: #fcefec; }
