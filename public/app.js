@@ -2798,17 +2798,30 @@ async function words(root) {  root.innerHTML = '<div class="loading">加载中�
       <div class="empty">词库还是空的——练一次复述，收尾报告会把替换词存进来。</div>`;
     return;
   }
+  // 分类：先展示预置的正规表达（seed），再展示你练出来积累的
+  const seed = list.filter((w) => w.kind === 'seed');
+  const learned = list.filter((w) => w.kind !== 'seed');
+  const kindLabel = (k) => k === 'seed' ? '🌟 精选' : '';
+  const wordCard = (w) => `
+    <div class="word-card">
+      <div class="word-head">
+        <span class="orig">${esc(w.word)}</span>
+        <span class="arrow">→</span>
+        <span class="better">${esc(w.better)}</span>
+        ${w.reason || w.context ? `<span class="word-kind">${kindLabel(w.kind)}</span>` : ''}
+      </div>
+      ${w.reason ? `<div class="word-reason"><b>为什么用：</b>${esc(w.reason)}</div>` : ''}
+      ${!w.reason && w.context ? `<div class="word-reason dim">${esc(w.context)}</div>` : ''}
+    </div>`;
   root.innerHTML = `
     <h2>词库 <span class="count">${list.length} 条</span></h2>
-    <div class="words-wrap">
-      ${list.map((w) => `
-        <div class="word-row">
-          <span class="orig">${esc(w.word)}</span>
-          <span class="arrow">→</span>
-          <span class="better">${esc(w.better)}</span>
-          <span class="ctx">${esc(w.context || '')}</span>
-        </div>`).join('')}
-    </div>`;
+    <p class="dim" style="margin-top:-6px">「→」是给你的表达升级：把平淡的口语换成更有深度的说法（成语 / 谚语 / 书面语）。每张卡都说明<b>为什么用、什么场合用</b>。</p>
+    ${learned.length ? `
+      <h3 class="words-sec-title">🎯 你练出来的</h3>
+      <div class="words-wrap">${learned.map(wordCard).join('')}</div>` : ''}
+    ${seed.length ? `
+      <h3 class="words-sec-title">🌟 精选表达（预置）</h3>
+      <div class="words-wrap">${seed.map(wordCard).join('')}</div>` : ''}`;
 }
 
 // ---------- 站长管理页 ----------

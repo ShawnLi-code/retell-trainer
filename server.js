@@ -89,6 +89,8 @@ app.use('/api', (req, res, next) => {
   const user = auth.readAuth(req);
   if (!user) return res.status(401).json({ error: '请先输入邀请码', needAuth: true });
   req.user = user;
+  // 懒触发：用户首次访问某页面时，给该用户库灌入预置词库（seed-words.json），保证词库有深度
+  try { db.seedWords(user.uid); } catch (e) { console.error('[seedWords]', e.message); }
   // 之后本请求内所有同步/异步的 db / bookshelf / interview 调用都自动落到这个用户的库
   return ctx.runWith({ scope: 'user', uid: user.uid, isOwner: Boolean(user.is_owner) }, next);
 });
@@ -430,7 +432,7 @@ app.post('/api/sessions/:id/turn', async (req, res) => {
       report.words = report.words.slice(0, 6); // 最多展示 6 条
       for (const w of report.words) {
         if (w && w.original && w.better) {
-          db.addWord(String(w.original), String(w.better), card.title);
+          db.addWord(String(w.original), String(w.better), card.title, String(w.reason || ''), 'learned');
         }
       }
       // 兜底字段
@@ -498,7 +500,7 @@ app.post('/api/speech/log', async (req, res) => {
     fb.score = Math.max(1, Math.min(5, Number(fb.score) || 3));
     // 口语词入库
     for (const w of fb.words.slice(0, 3)) {
-      if (w && w.original && w.better) db.addWord(String(w.original), String(w.better), `演讲《${topic}》`);
+      if (w && w.original && w.better) db.addWord(String(w.original), String(w.better), `演讲《${topic}》`, String(w.reason || ''), 'learned');
     }
     const id = db.createSpeechLog({ topic, kind, spoken: text, score: fb.score, feedback: fb });
     res.json({ id, feedback: fb });

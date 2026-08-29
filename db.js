@@ -70,6 +70,8 @@ CREATE TABLE IF NOT EXISTS words (
   word TEXT NOT NULL,
   better TEXT NOT NULL,
   context TEXT DEFAULT '',
+  reason TEXT DEFAULT '',
+  kind TEXT DEFAULT '',
   created_at TEXT DEFAULT (datetime('now','localtime'))
 );
 CREATE TABLE IF NOT EXISTS speech_logs (
@@ -117,6 +119,8 @@ function openUser(uid) {
   c = new DatabaseSync(path.join(USERS_DIR, safeUid + '.db'));
   c.exec(USER_SCHEMA);
   try { c.exec(`ALTER TABLE sessions ADD COLUMN card_title TEXT DEFAULT ''`); } catch { /* 已存在 */ }
+  try { c.exec(`ALTER TABLE words ADD COLUMN reason TEXT DEFAULT ''`); } catch { /* 已存在 */ }
+  try { c.exec(`ALTER TABLE words ADD COLUMN kind TEXT DEFAULT ''`); } catch { /* 已存在 */ }
   // 该库残留的进行中任务标失败（服务重启）
   try {
     c.prepare(`UPDATE link_tasks SET status='failed', error='服务重启导致中断，请重新粘贴链接重试', pct=0, updated_at=datetime('now','localtime') WHERE status IN ('queued','running')`).run();
@@ -273,8 +277,8 @@ function listHistory(limit = 30) {
 }
 
 // ============ words（当前用户库） ============
-function addWord(word, better, context = '') {
-  U().prepare(`INSERT INTO words (word, better, context) VALUES (?, ?, ?)`).run(word, better, context);
+function addWord(word, better, context = '', reason = '', kind = '') {
+  U().prepare(`INSERT INTO words (word, better, context, reason, kind) VALUES (?, ?, ?, ?, ?)`).run(word, better, context, reason, kind);
 }
 function listWords() {
   return U().prepare(`SELECT * FROM words ORDER BY id DESC`).all();
@@ -363,6 +367,40 @@ function totalSessions() {
   return Number(U().prepare(`SELECT COUNT(*) AS n FROM sessions`).get().n);
 }
 
+// ============ 预置词库（开机给每个用户库灌入 seed-words.json，只灌一次） ============
+// 每个用户库第一次接入时导入这批优质表达（成语/谚语/书面语 + 用法），确保词库"有深度够丰富"。
+// 避免重复：用 (word,better) 去重，已存在则跳过。
+const SEED_WORDS = (() => {
+  try {
+    const p = path.join(__dirname, 'seed-words.json');
+    if (fs.existsSync(p)) return JSON.parse(fs.readFileSync(p, 'utf8'));
+  } catch (e) { /* 无种子文件或解析失败则不导入 */ }
+  return [];
+})();
+const seededUsers = new Set(); // 本进程内已灌过的用户（二次调用不重复）
+function seedWords(uid) {
+  if (seededUsers.has(uid) || !SEED_WORDS.length) return 0;
+  seededUsers.add(uid);
+  const c = openUser(uid);
+  const exists = c.prepare(`SELECT word, better FROM words`);
+  const have = new Set(exists.all().map((r) => r.word + '|' + r.better));
+  const ins = c.prepare(`INSERT INTO words (word, better, context, reason, kind) VALUES (?, ?, ?, ?, ?)`);
+  let added = 0;
+  c.exec('BEGIN');
+  try {
+    for (const w of SEED_WORDS) {
+      if (have.has(w.word + '|' + w.better)) continue;
+      ins.run(w.word, w.better, (w.context || ''), (w.reason || ''), (w.kind || 'seed'));
+      added++;
+    }
+    c.exec('COMMIT');
+  } catch (e) {
+    c.exec('ROLLBACK');
+    throw e;
+  }
+  return added;
+}
+
 module.exports = {
   localDayKey,
   // cards
@@ -371,7 +409,7 @@ module.exports = {
   // sessions
   newSession, getSession, saveTurns, finishSession, calcStreak, practicedOn, listHistory,
   // words
-  addWord, listWords,
+  addWord, listWords, seedWords,
   // speech
   createSpeechLog, listSpeechLogs,
   // marks
