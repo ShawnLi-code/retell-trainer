@@ -654,6 +654,30 @@ const setMic = (btn, label, icon = ICONS.mic) => {
   btn.innerHTML = iconBtn(icon, label);
 };
 
+// 口语去重：压掉连续重复的字/词（"我我我" → "我"、"那个那个" → "那个"、"很很" → "很"）。
+// 只在"实时字幕"应用，保证不损实时；保留单字停顿（如"嗯"），不误伤正常叠词（如"慢慢"、人名"丽丽"）。
+function dedupSpeech(s) {
+  if (!s) return s;
+  let out = '';
+  const REDUNDANT = new Set(['嗯', '呃', '啊', '哦']); // 语气词允许重复（表停顿），不强压
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    // 连续 2 个及以上相同字符：只取 1 个（除非是冗余语气词刻意省略？这里统一压单字重复）
+    if (out.endsWith(ch) && ch !== ' ' && !REDUNDANT.has(ch)) {
+      // 跳过重复字符
+      continue;
+    }
+    out += ch;
+  }
+  // 去重复词（2 字词连续出现）："那个那个"→"那个"；避免误伤，仅针对常见口头禅式叠词
+  const PHRASES = ['那个', '然后', '就是', '这个', '一个', '我们', '你们', '他们', '我觉得', '就是说', '一个', '什么', '还有', '是不是', '因为', '所以', '可以', '可能', '没有', '什么'];
+  for (const p of PHRASES) {
+    const re = new RegExp(('(?:' + p + '){2,}'), 'g');
+    out = out.replace(re, p);
+  }
+  return out;
+}
+
 function setupMic(textarea, interimEl, micBtn, sendBtn, opts = {}) {
   const DUR = opts.duration || 90; // 一轮时限（秒）
   const START_LABEL = opts.startLabel || `开始（${DUR} 秒）`;
@@ -822,7 +846,6 @@ function setupMic(textarea, interimEl, micBtn, sendBtn, opts = {}) {
           // r.final 是增量（新文字）；用「去掉与已累积文字重叠的尾部」兜底防 reset 重排重复
           if (r.final) {
             let inc = r.final;
-            // 若增量与已累积文字有重复尾巴（模型 endpo reset 重排整句），做最长公共前缀重叠消除
             const st = streamFinal;
             let overlap = 0;
             for (let k = Math.min(st.length, inc.length); k > 0; k--) {
@@ -830,6 +853,8 @@ function setupMic(textarea, interimEl, micBtn, sendBtn, opts = {}) {
             }
             if (overlap >= 2) inc = inc.slice(overlap);
             streamFinal += inc;
+            // 口语去重（压"我我"类重复 / "那个那个"叠词），只对实时字幕，保证不损实时 + 别太重
+            streamFinal = dedupSpeech(streamFinal);
             const full = baseText ? baseText + '\n' + streamFinal : streamFinal;
             textarea.value = full;
             if (interimEl) interimEl.textContent = '';
@@ -887,6 +912,20 @@ function setupMic(textarea, interimEl, micBtn, sendBtn, opts = {}) {
     textarea.value = ok ? confirmed : (confirmed || '');
     if (interimEl) interimEl.textContent = '';
     if (opts.onText) opts.onText(textarea.value);
+
+    // 停录后：对实时字幕做一次"去重 + AI 补标点"（异步、可失败，完成后再覆盖输入框）
+    if (ok && confirmed && confirmed.trim().length >= 20) {
+      try {
+        const fmtR = await api.post('/api/text/format', { text: confirmed });
+        if (fmtR.text && fmtR.text.trim() && fmtR.formatted) {
+          confirmed = fmtR.text.trim();
+          if (baseText) confirmed = baseText + '\n' + confirmed;
+          textarea.value = confirmed;
+          if (opts.onText) opts.onText(confirmed);
+        }
+      } catch { /* 补标点失败不阻塞，保留去重后的原文 */ }
+    }
+
     submitting = false;
     setMic(micBtn, micLabel());
     if (autoSubmit && sendBtn && !sendBtn.disabled) setTimeout(() => sendBtn.click(), 400);

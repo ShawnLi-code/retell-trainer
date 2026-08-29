@@ -238,6 +238,21 @@ app.post('/api/asr/stream',
     }
   });
 
+// ---------- 文本整理：口语去重 + AI 补标点（停录后对实时字幕加工） ----------
+app.post('/api/text/format', async (req, res) => {
+  try {
+    const raw = String((req.body || {}).text || '').trim();
+    if (!raw) return res.status(400).json({ error: 'text 不能为空' });
+    // 先本地去重（快），再 AI 补标点（可失败，回退原文）
+    const fmtInfo = {};
+    const text = await formatTranscript(raw, fmtInfo);
+    res.json({ text, formatted: Boolean(fmtInfo.ok) });
+  } catch (err) {
+    console.error('[text format]', err.message);
+    res.status(502).json({ error: '整理失败：' + String(err.message || err).slice(0, 100) });
+  }
+});
+
 // ---------- 练习录音 → 服务端 Whisper 转写（不再依赖浏览器 ASR） ----------
 app.post('/api/practice/transcribe',
   express.raw({ type: (req) => String(req.headers['content-type'] || '').startsWith('audio/'), limit: '30mb' }),
@@ -948,12 +963,27 @@ function cleanTranscript(t) {
   return String(t || '').replace(/\r\n?/g, '\n').replace(/[ \t\u3000]+/g, ' ').trim();
 }
 
+// 口语去重（与前端 dedupSpeech 同款）：压连续重复字与常见口头禅叠词，供补标点前清理
+function dedupSpeech(s) {
+  if (!s) return s;
+  let out = '';
+  const REDUNDANT = new Set(['嗯', '呃', '啊', '哦']); // 语气词允许重复表示停顿
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (out.endsWith(ch) && ch !== ' ' && ch !== '\n' && !REDUNDANT.has(ch)) continue;
+    out += ch;
+  }
+  const PHRASES = ['那个', '然后', '就是', '这个', '一个', '我们', '你们', '他们', '我觉得', '就是说', '什么', '还有', '是不是', '因为', '所以', '可以', '可能', '没有'];
+  for (const p of PHRASES) out = out.replace(new RegExp('(?:' + p + '){2,}', 'g'), p);
+  return out;
+}
+
 // 转写稿格式化：LLM 补标点、分段；失败静默回退原文，绝不因此让任务失败。
 // 总时长上限 FORMAT_TIMEOUT_MS（默认 100 秒）：模型链逐渠道兜底可能拖到 5 分钟，
 // 等太久体验差，超时直接回退原文（任务照样完成，走「✨ AI 整理格式」补救按钮即可）。
 // info 参数回传诊断信息（info.ok = 是否经 AI 格式化；info.skip = 回退原因）
 async function formatTranscript(raw, info) {
-  const text = String(raw || '').trim();
+  const text = dedupSpeech(String(raw || '').trim());
   if (!text || !isConfigured()) {
     if (info) { info.ok = false; info.skip = !text ? '空' : 'LLM 未配置'; }
     return text;
