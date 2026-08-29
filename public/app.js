@@ -742,12 +742,7 @@ function setupMic(textarea, interimEl, micBtn, sendBtn, opts = {}) {
       }
     }
     try {
-      let mime = '';
-      if (window.MediaRecorder.isTypeSupported) {
-        if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) mime = 'audio/webm;codecs=opus';
-        else if (MediaRecorder.isTypeSupported('audio/webm')) mime = 'audio/webm';
-        else if (MediaRecorder.isTypeSupported('audio/mp4')) mime = 'audio/mp4';
-      }
+      const mime = mimeType();
       mediaRecorder = mime ? new MediaRecorder(recStream, { mimeType: mime }) : new MediaRecorder(recStream);
     } catch (err) {
       releaseStream();
@@ -761,30 +756,97 @@ function setupMic(textarea, interimEl, micBtn, sendBtn, opts = {}) {
     recording = true;
     setMic(micBtn, '停止录音', ICONS.stop);
 
-    // 实时字幕（纯展示）：失败静默放弃，不影响录音与最终转写
-    if (SR) {
-      recognition = new SR();
-      recognition.lang = 'zh-CN';
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.onresult = (e) => {
-        let interim = '';
-        for (let i = e.resultIndex; i < e.results.length; i++) {
-          const t = e.results[i][0].transcript;
-          if (e.results[i].isFinal) confirmed += t;
-          else interim += t;
-        }
-        textarea.value = confirmed;
-        interimEl.textContent = interim;
-      };
-      recognition.onerror = () => { /* 字幕服务不可用就静默降级 */ };
-      try { recognition.start(); } catch { /* 忽略 */ }
-    } else if (interimEl) {
-      interimEl.textContent = '（实时字幕不支持当前浏览器，停录后由服务器转写）';
-    }
+    // ======= 流式实时字幕：Web Audio 采 16k PCM → /api/asr/stream（边说边看字） =======
+    startPump();
 
     mediaRecorder.start(1000);
     startTimer();
+  }
+
+  const mimeType = () => {
+    if (window.MediaRecorder.isTypeSupported) {
+      if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) return 'audio/webm;codecs=opus';
+      if (MediaRecorder.isTypeSupported('audio/webm')) return 'audio/webm';
+      if (MediaRecorder.isTypeSupported('audio/mp4')) return 'audio/mp4';
+    }
+    return '';
+  };
+
+  // ---------- 流式 PCM 采集与识别（边说边看字） ----------
+  let actx = null;
+  let proc = null;
+  let sid = '';
+  let streamFinal = '';   // 累积已定稿文字
+  let streamOK = false;   // 流式是否可用（失败则静默回退整段）
+  let pumpTimer = null;
+
+  function startPump() {
+    sid = 's' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+    streamFinal = '';
+    streamOK = false;
+    try {
+      actx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      const source = actx.createMediaStreamSource(recStream);
+      const bufferSize = 4096;
+      proc = actx.createScriptProcessor(bufferSize, 1, 1);
+      const pending = [];
+      const SEND_EVERY = 8000; // 约 0.5s 音频（16k * 0.5）
+      let acc = [];
+      proc.onaudioprocess = (e) => {
+        const ch = e.inputBuffer.getChannelData(0);
+        for (let i = 0; i < ch.length; i++) {
+          const s = Math.max(-1, Math.min(1, ch[i]));
+          acc.push(Math.round(s * 32767));
+        }
+        if (acc.length >= SEND_EVERY) {
+          const send = acc.length;
+          pending.push(acc);
+          acc = [];
+        }
+      };
+      source.connect(proc);
+      proc.connect(actx.destination); // 静默输出
+      pumpTimer = setInterval(async () => {
+        if (!pending.length) return;
+        const chunks = pending.splice(0, pending.length);
+        let pcm = [];
+        for (const c of chunks) pcm = pcm.concat(c);
+        const n = pcm.length * 2;
+        const bytes = new Uint8Array(n);
+        const dv = new DataView(bytes.buffer);
+        for (let i = 0; i < pcm.length; i++) dv.setInt16(i * 2, pcm[i], true);
+        const b64 = btoa(String.fromCharCode.apply(null, bytes));
+        try {
+          const r = await api.post('/api/asr/stream', { sid, audio: b64, reset: false });
+          streamOK = true;
+          // r.final 是增量（新文字）；用「去掉与已累积文字重叠的尾部」兜底防 reset 重排重复
+          if (r.final) {
+            let inc = r.final;
+            // 若增量与已累积文字有重复尾巴（模型 endpo reset 重排整句），做最长公共前缀重叠消除
+            const st = streamFinal;
+            let overlap = 0;
+            for (let k = Math.min(st.length, inc.length); k > 0; k--) {
+              if (st.slice(-k) === inc.slice(0, k)) { overlap = k; break; }
+            }
+            if (overlap >= 2) inc = inc.slice(overlap);
+            streamFinal += inc;
+            const full = baseText ? baseText + '\n' + streamFinal : streamFinal;
+            textarea.value = full;
+            if (interimEl) interimEl.textContent = '';
+            if (opts.onText) opts.onText(full);
+          }
+        } catch { /* 流式失败静默：最终仍走整段 */ }
+      }, 600);
+    } catch (err) {
+      console.warn('[stream asr] 启动失败，降级为整段转写：', err);
+    }
+  }
+
+  function stopPump() {
+    try { if (pumpTimer) clearInterval(pumpTimer); pumpTimer = null; } catch { /* */ }
+    try { if (proc) proc.disconnect(); } catch { /* */ }
+    try { if (actx) actx.close(); } catch { /* */ }
+    proc = null; actx = null;
   }
 
   async function finishRecording({ autoSubmit = false } = {}) {
@@ -801,12 +863,17 @@ function setupMic(textarea, interimEl, micBtn, sendBtn, opts = {}) {
       try { rec.requestData(); rec.stop(); } catch { resolve(new Blob(recordChunks, { type: mime })); }
     });
     stopInterim();
+    stopPump();
     const blob = await blobP.catch(() => null);
     releaseStream();
-    await new Promise((r) => setTimeout(r, 350)); // 等字幕 onend 把最后一句尾巴并进 confirmed
+    await new Promise((r) => setTimeout(r, 350));
 
+    // 流式可用且已有可观文本 → 直接用（边说边看的结果）；否则回退整段 Whisper 兜底
     let ok = false;
-    if (blob && blob.size > 2000) {
+    if (streamOK && streamFinal.trim().length >= 20) {
+      confirmed = (baseText ? baseText + '\n' : '') + streamFinal.trim();
+      ok = true;
+    } else if (blob && blob.size > 2000) {
       try {
         const r = await api.raw('/api/practice/transcribe', blob);
         if (r.text && r.text.trim()) {
@@ -814,7 +881,7 @@ function setupMic(textarea, interimEl, micBtn, sendBtn, opts = {}) {
           ok = true;
         }
       } catch (err) {
-        toast('服务器转写没成功，先用浏览器识别的文本：' + err.message);
+        toast('服务器转写没成功，先用已识别的文本：' + err.message);
       }
     }
     textarea.value = ok ? confirmed : (confirmed || '');

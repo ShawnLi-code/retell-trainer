@@ -203,6 +203,41 @@ app.post('/api/practice/pick', (req, res) => {
   res.json({ card: { id: card.id, title: card.title, content: card.content, length: card.content.length } });
 });
 
+// ---------- 流式 ASR（sherpa-onnx 中文）real-time 边录边看字 ----------
+// 浏览器通过 Web Audio 采 16k PCM16 → 每帧 POST 到 /api/asr/stream → 服务端转发给
+// sherpa 常驻进程增量解码 → 即时返回 {final, interim}。
+const ASR_STREAM_URL = process.env.ASR_STREAM_URL || 'http://127.0.0.1:3026';
+
+async function streamAsr(pcmBase64, sid, reset) {
+  const res = await fetch(ASR_STREAM_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ audio: pcmBase64, sid, reset: !!reset }),
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!res.ok) throw new Error('流式识别服务返回 ' + res.status);
+  const data = await res.json();
+  // {final: 增量文字, all: 全量文字} —— 前端用 final 追加，避免重复
+  return data;
+}
+
+app.post('/api/asr/stream',
+  express.json({ limit: '2mb' }),
+  async (req, res) => {
+    try {
+      const sid = String((req.body || {}).sid || '');
+      const audio = String((req.body || {}).audio || ''); // base64 PCM16
+      const reset = Boolean((req.body || {}).reset);
+      if (!sid) return res.status(400).json({ error: '缺少会话 id' });
+      if (!audio) return res.status(400).json({ error: '没有音频数据' });
+      const out = await streamAsr(audio, sid, reset);
+      res.json(out);
+    } catch (err) {
+      console.error('[stream asr]', err.message);
+      res.status(502).json({ error: '流式识别出错：' + String(err.message || err).slice(0, 120) });
+    }
+  });
+
 // ---------- 练习录音 → 服务端 Whisper 转写（不再依赖浏览器 ASR） ----------
 app.post('/api/practice/transcribe',
   express.raw({ type: (req) => String(req.headers['content-type'] || '').startsWith('audio/'), limit: '30mb' }),
