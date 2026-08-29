@@ -166,7 +166,7 @@ const session = { id: null, card: null, turns: [], busy: false };
 const RETELL_SECONDS = 90;
 
 // ---------- 路由 ----------
-const NAV_GROUP = { home: 'practice', practice: 'practice', speech: 'speech', cards: 'material', bookshelf: 'reading', interview: 'interview', books: 'library', words: 'words', history: 'history', admin: 'admin' };
+const NAV_GROUP = { home: 'practice', practice: 'practice', speech: 'speech', cards: 'material', bookshelf: 'reading', interview: 'interview', books: 'library', words: 'words', history: 'history', settings: 'settings', admin: 'admin' };
 function router() {
   const parts = (location.hash.replace(/^#\/?/, '') || 'home').split('/');
   const hash = parts[0];
@@ -180,7 +180,7 @@ function router() {
   app.innerHTML = '';
   app.className = '';
   if (hash === 'cards') { cards(app, parts[1] || 'ted'); return; }
-  const views = { home, practice, speech, bookshelf, interview, books, history, words, admin };
+  const views = { home, practice, speech, bookshelf, interview, books, history, words, settings, admin };
   (views[hash] || home)(app);
 }
 window.addEventListener('hashchange', router);
@@ -678,6 +678,55 @@ function dedupSpeech(s) {
   return out;
 }
 
+// ---------- ASR 模式设置（浏览器识别 vs 服务器识别） ----------
+// 模式存 localStorage，所有复述模块（复述页/演讲页）共用。
+// 'browser'（默认）：优先浏览器实时识别，失败自动降级服务器识别（停下来也用服务器 Whisper 精转写）
+// 'server'       ：只用服务器识别（当前=Whisper 精转写），不用浏览器
+function getAsrMode() {
+  const m = String(localStorage.getItem('asr-mode') || '');
+  return (m === 'browser' || m === 'server') ? m : 'browser';
+}
+function setAsrMode(mode) {
+  localStorage.setItem('asr-mode', mode === 'server' ? 'server' : 'browser');
+}
+// 浏览器是否支持语音识别（有 API 且非本地文件）
+function browserAsrSupported() {
+  return !!(window.SpeechRecognition || window.webkitSpeechRecognition);
+}
+
+// ---------- 设置页 ----------
+function settings(root) {
+  const mode = getAsrMode();
+  const probeOk = browserAsrSupported();
+  root.innerHTML = `
+    <h2>设置</h2>
+    <div class="settings-card">
+      <h3>🎙️ 语音识别（复述 / 演讲时把你说的话转成文字）</h3>
+      <p class="dim">选择用哪种语音识别。识别转出的文字会显示在输入框，供你提交后 AI 总结。</p>
+      <div class="setting-opt">
+        <label class="setting-row ${mode === 'browser' ? 'active' : ''}">
+          <input type="radio" name="asr" value="browser" ${mode === 'browser' ? 'checked' : ''}>
+          <div><b>浏览器识别（推荐 · 默认）</b><p class="dim">用浏览器的语音识别，实时看到自己说的话。若浏览器不支持（如在部分环境/国内不可用），自动降级为服务器识别，不会转写失败。</p></div>
+        </label>
+        <label class="setting-row ${mode === 'server' ? 'active' : ''}">
+          <input type="radio" name="asr" value="server" ${mode === 'server' ? 'checked' : ''}>
+          <div><b>服务器识别</b><p class="dim">用你服务器自带的 Whisper 识别，不依赖浏览器。停录后转写，准确度高。</p></div>
+        </label>
+      </div>
+      <p class="dim" id="asr-browser-status">${probeOk ? '当前浏览器支持语音识别 ✅' : '当前浏览器【不支持】语音识别 ⚠️ —— 选浏览器会自动降级到服务器识别，请放心'}</p>
+    </div>`;
+  root.querySelectorAll('input[name=asr]').forEach((inp) => {
+    inp.addEventListener('change', () => {
+      if (inp.checked) {
+        setAsrMode(inp.value);
+        root.querySelectorAll('.setting-row').forEach((r) => r.classList.remove('active'));
+        inp.closest('.setting-row').classList.add('active');
+        toast('已保存：' + (inp.value === 'browser' ? '浏览器识别' : '服务器识别'));
+      }
+    });
+  });
+}
+
 function setupMic(textarea, interimEl, micBtn, sendBtn, opts = {}) {
   const DUR = opts.duration || 90; // 一轮时限（秒）
   const START_LABEL = opts.startLabel || `开始（${DUR} 秒）`;
@@ -780,11 +829,63 @@ function setupMic(textarea, interimEl, micBtn, sendBtn, opts = {}) {
     recording = true;
     setMic(micBtn, '停止录音', ICONS.stop);
 
-    // ======= 流式实时字幕：Web Audio 采 16k PCM → /api/asr/stream（边说边看字） =======
-    startPump();
+    // ======= 实时字幕：按设置选浏览器识别或服务器流式识别（边说边看字） =======
+    // browser 模式：优先浏览器识别，失败/不支持自动降级服务器流式
+    if (getAsrMode() === 'browser') {
+      startBrowserRec() || startPump();
+    } else {
+      startServerRec();
+    }
 
     mediaRecorder.start(1000);
     startTimer();
+  }
+
+  // ---------- 浏览器实时识别（Web Speech API）----------
+  let browserRec = null;
+  let browserFinal = '';  // 浏览器识别的累积文本
+  let browserOK = false;
+  function startBrowserRec() {
+    browserFinal = confirmed; // 从现有输入框内容后续
+    browserOK = false;
+    if (!window.SpeechRecognition && !window.webkitSpeechRecognition) return false;
+    try {
+      const SRc = window.SpeechRecognition || window.webkitSpeechRecognition;
+      browserRec = new SRc();
+      browserRec.lang = 'zh-CN';
+      browserRec.continuous = true;
+      browserRec.interimResults = true;
+      browserRec.onresult = (e) => {
+        let interim = '';
+        let fin = '';
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+          const t = e.results[i][0].transcript;
+          if (e.results[i].isFinal) fin += t; else interim += t;
+        }
+        if (fin) browserFinal += fin;
+        browserOK = true;
+        const full = baseText ? baseText + '\n' + dedupSpeech(browserFinal) : dedupSpeech(browserFinal);
+        textarea.value = full + (interim ? interim : '');
+        if (opts.onText) opts.onText(textarea.value);
+      };
+      browserRec.onerror = (e) => {
+        // 浏览器识别报错（网络/权限等）→ 降级到服务器流式
+        if (e.error === 'network' || e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+          try { if (browserRec) browserRec.stop(); } catch { /* */ }
+          browserRec = null;
+          if (recording) startPump(); // 立即降级
+        }
+      };
+      browserRec.onend = () => { /* 浏览器识别结束，靠 mediaRecorder 数据兜底 */ };
+      browserRec.start();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  function stopBrowserRec() {
+    try { if (browserRec) browserRec.stop(); } catch { /* */ }
+    browserRec = null;
   }
 
   const mimeType = () => {
@@ -873,6 +974,7 @@ function setupMic(textarea, interimEl, micBtn, sendBtn, opts = {}) {
     try { if (actx) actx.close(); } catch { /* */ }
     proc = null; actx = null;
   }
+  const startServerRec = startPump; // 服务器流式识别 = startPump
 
   async function finishRecording({ autoSubmit = false } = {}) {
     if (!recording || submitting) return;
@@ -909,10 +1011,15 @@ function setupMic(textarea, interimEl, micBtn, sendBtn, opts = {}) {
         toast('服务器转写没成功，先用已识别的文本：' + err.message);
       }
     }
-    // Whisper 失败时，回退流式字幕（至少有内容）
-    if (!ok && streamOK && streamFinal.trim().length >= 20) {
-      confirmed = (baseText ? baseText + '\n' : '') + streamFinal.trim();
-      ok = true;
+    // Whisper 失败时，回退实时字幕（至少有内容）：优先浏览器识别的结果，其次服务器流式
+    if (!ok) {
+      const fallbackText = getAsrMode() === 'browser' && browserOK
+        ? dedupSpeech(browserFinal)
+        : (streamOK ? streamFinal : '');
+      if (fallbackText && fallbackText.trim().length >= 20) {
+        confirmed = (baseText ? baseText + '\n' : '') + fallbackText.trim();
+        ok = true;
+      }
     }
     textarea.value = ok ? confirmed : (confirmed || '');
     if (interimEl) interimEl.textContent = '';
@@ -938,6 +1045,7 @@ function setupMic(textarea, interimEl, micBtn, sendBtn, opts = {}) {
 
   function stopInterim() {
     try { recognition && recognition.stop(); } catch { /* */ }
+    stopBrowserRec();
   }
 
   micBtn.addEventListener('click', () => {

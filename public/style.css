@@ -1555,3 +1555,21 @@ body.locked { overflow: hidden; }
   animation: histspin .8s linear infinite;
 }
 @keyframes histspin { to { transform: rotate(360deg); } }
+
+/* ---------- 设置页 ---------- */
+.settings-card {
+  background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+  box-shadow: var(--shadow); padding: 18px 20px; max-width: 640px;
+}
+.settings-card h3 { margin: 0 0 8px; }
+.setting-opt { display: flex; flex-direction: column; gap: 10px; margin: 14px 0; }
+.setting-row {
+  display: flex; gap: 12px; align-items: flex-start; padding: 12px 14px;
+  border: 1px solid var(--line); border-radius: 10px; cursor: pointer;
+  transition: border-color .15s, background .15s;
+}
+.setting-row:hover { border-color: var(--brand); }
+.setting-row.active { border-color: var(--brand); background: rgba(162,76,22,0.05); }
+.setting-row input { margin-top: 4px; }
+.setting-row b { display: block; }
+.setting-row p { margin: 4px 0 0; }
