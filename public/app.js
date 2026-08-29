@@ -91,7 +91,9 @@ function hideAuthGate() {
 }
 
 function applyMe(user) {
-  ME = { name: user.name || '', isOwner: Boolean(user.is_owner) };
+  // 兼容 is_owner / isOwner 两种字段名（后端不同接口风格不一）
+  const owner = Boolean(user.is_owner ?? user.isOwner);
+  ME = { name: user.name || '', isOwner: owner, uid: user.uid || '' };
   const chip = $('#user-chip');
   if (chip) { chip.hidden = false; chip.textContent = (ME.isOwner ? '👑 ' : '') + ME.name; }
   const lb = $('#logout-btn');
@@ -1635,47 +1637,111 @@ async function history(root) {
     root.innerHTML = `<div class="empty">${esc(err.message)}</div>`;
     return;
   }
-  if (!list.length) {
+  if (!list || !list.length) {
     root.innerHTML = `<div class="empty">还没有练习记录。<a href="#/home">去练第一次</a></div>`;
     return;
   }
-  root.innerHTML = `<h2>练习历史 <span class="count">${list.length} 次 · 点击查看完整报告</span></h2>`;
-  const wrap = document.createElement('div');
-  list.forEach((s) => {
-    const item = document.createElement('div');
-    item.className = 'history-item';
-    const usrTurns = s.turns.filter((t) => t.role === 'user');
-    item.innerHTML = `
-      <div><b>${esc(s.cardTitle)}</b></div>
-      <div class="meta">${esc(s.date)} · 复述 ${s.turnsCount} 轮 · ${esc(s.summary || '')}</div>
-      <div class="history-detail" hidden>
-        ${s.report && s.report.summary ? `
-          <div class="report replay">
-            ${usrTurns.length ? `
-              <div class="your-retell"><b>🗣 你的复述</b><p>${esc(usrTurns[usrTurns.length - 1].text)}</p></div>` : ''}
-            ${reportHtml(s.report)}
-          </div>` : '<div class="dim">（该次练习没有完整报告）</div>'}
-        <div class="actions">
-          <button class="primary" data-replay>🔁 再次复述本篇</button>
-        </div>
-      </div>`;
-    item.addEventListener('click', (e) => {
-      if (e.target.closest('[data-replay]')) return;
-      const d = item.querySelector('.history-detail');
-      d.hidden = !d.hidden;
-    });
-    item.querySelector('[data-replay]').addEventListener('click', async () => {
-      item.querySelector('[data-replay]').disabled = true;
-      try {
-        const all = await api.get('/api/cards');
-        const card = all.find((c) => c.id === s.cardId);
-        if (!card) return toast('素材已被删除，无法复述');
-        startPractice(card);
-      } catch (err) { toast(err.message); item.querySelector('[data-replay]').disabled = false; }
-    });
-    wrap.appendChild(item);
+  root.innerHTML = `<h2>练习历史 <span class="count">${list.length} 次</span></h2>
+    <div class="history-wrap">
+      ${list.map((s) => {
+        const done = s.status === 'done';
+        const badge = done
+          ? '<span class="hist-badge done">✅ 已完成</span>'
+          : '<span class="hist-badge running">⏳ AI 总结中</span>';
+        return `
+          <div class="history-item hist-row" data-id="${s.id}" data-status="${s.status}">
+            <div class="hist-main">
+              <b>${esc(s.cardTitle)}</b>
+              <span class="dim">${esc(s.date)} · 复述 ${s.turnsCount} 轮</span>
+              ${badge}
+            </div>
+            <div class="hist-preview">
+              ${done
+                ? `<span class="truncate">${esc(s.summary || '')}</span>`
+                : '<span class="dim">AI 正在为你总结这次练习…点击查看进度</span>'}
+            </div>
+            <div class="hist-actions"><button class="ghost small" data-open="查看">查看</button></div>
+          </div>`;
+      }).join('')}
+    </div>`;
+  // 点击整行或用"查看"都弹窗
+  const open = (item) => {
+    const id = item.dataset.id;
+    const status = item.dataset.status;
+    const full = list.find((x) => String(x.id) === String(id));
+    openHistoryModal(item, full, root, () => history(root)); // 重开/刷新用
+  };
+  root.querySelectorAll('.hist-row').forEach((item) => {
+    item.addEventListener('click', (e) => { if (e.target.closest('button')) return; open(item); });
+    item.querySelector('[data-open]')?.addEventListener('click', () => open(item));
   });
-  root.appendChild(wrap);
+}
+
+// 历史详情弹窗：展示 AI 进度（总结中）或完整报告（已完成），含用户复述内容
+function openHistoryModal(anchor, full, root, rerender) {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  const done = !!full && full.status === 'done';
+  const usrTurns = (full && full.turns ? full.turns : []).filter((t) => t.role === 'user');
+  const last = usrTurns.length ? usrTurns[usrTurns.length - 1].text : '';
+  overlay.innerHTML = `
+    <div class="modal history-modal">
+      <div class="modal-head">
+        <b>${esc(full ? full.cardTitle : '练习记录')}</b>
+        <span class="dim">${full ? esc(full.date) : ''}${done ? ` · ${full.turnsCount} 轮` : ''}</span>
+        <button class="modal-close" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-body">
+        ${last ? `<div class="your-retell"><b>🗣 你的复述</b><p>${esc(last)}</p></div>` : ''}
+        ${done && full.report ? `
+          <div class="report replay">${reportHtml(full.report)}</div>` : `
+          <div class="hist-summarizing">
+            <div class="hist-spin"></div>
+            <b>AI 总结中…</b>
+            <p class="dim">正在分析你的复述，生成「示范表达 / 差异总结 / 听众追问」。完成后会自动刷新，稍等几秒。</p>
+          </div>`}
+      </div>
+      ${done ? `<div class="modal-foot"><button class="primary" data-replay>🔁 再次复述本篇</button></div>` : ''}
+    </div>`;
+  document.body.appendChild(overlay);
+  let close = () => overlay.remove();
+  let timer = null;
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) { if (timer) clearInterval(timer); close(); }
+  });
+
+  // 总结中：每 2 秒拉一次该会话，完成就刷新内容
+  if (!done) {
+    timer = setInterval(async () => {
+      try {
+        const all = await api.get('/api/history');
+        const cur = (all || []).find((x) => String(x.id) === String(full.id));
+        if (cur && cur.status === 'done') {
+          clearInterval(timer);
+          close();
+          if (rerender) rerender();          // 列表刷新为已完成
+          // 重新打开显示报告
+          const nl = (await api.get('/api/history'));
+          const nf = (nl || []).find((x) => String(x.id) === String(full.id));
+          openHistoryModal(anchor, nf, root, rerender);
+        }
+      } catch { /* 忽略轮询错误 */ }
+    }, 2000);
+  }
+  const closeBtn = overlay.querySelector('.modal-close');
+  if (closeBtn) closeBtn.addEventListener('click', () => { if (timer) clearInterval(timer); close(); });
+
+  const rep = overlay.querySelector('[data-replay]');
+  if (rep) rep.addEventListener('click', async () => {
+    rep.disabled = true;
+    try {
+      const all = await api.get('/api/cards');
+      const card = all.find((c) => String(c.id) === String(full.cardId));
+      if (!card) return toast('素材已被删除，无法复述');
+      close();
+      startPractice(card);
+    } catch (err) { toast(err.message); rep.disabled = false; }
+  });
 }
 
 // ---------- 读书（本地书架） ----------

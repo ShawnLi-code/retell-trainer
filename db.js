@@ -255,13 +255,17 @@ function listHistory(limit = 30) {
     let report = {};
     try { turns = JSON.parse(row.turns || '[]'); } catch {}
     try { report = JSON.parse(row.report || '{}'); } catch {}
+    const usrTurns = turns.filter((t) => t.role === 'user');
+    const hasReport = !!(report && (report.summary || report.demo));
     return {
       id: row.id,
       cardId: row.card_id,
       date: String(row.started_at).slice(0, 10),
       cardTitle: row.card_title || '',
-      turnsCount: turns.filter((t) => t.role === 'user').length,
+      turnsCount: usrTurns.length,
       summary: report.summary || '',
+      status: hasReport ? 'done' : 'summarizing', // 无报告=AI 总结中/未完成
+      lastRetell: usrTurns.length ? usrTurns[usrTurns.length - 1].text : '',
       turns,
       report,
     };

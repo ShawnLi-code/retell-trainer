@@ -156,7 +156,7 @@ app.post('/api/admin/users/:uid/revoke', requireOwner, (req, res) => {
 app.get('/api/state', (req, res) => {
   const day = db.localDayKey();
   res.json({
-    me: { name: req.user.name, isOwner: Boolean(req.user.is_owner) },
+    me: { name: req.user.name, uid: req.user.uid, isOwner: Boolean(req.user.is_owner) },
     todayCard: db.getTodayCard(day),
     practicedToday: db.practicedOn(day),
     streak: db.calcStreak(),

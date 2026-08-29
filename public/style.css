@@ -1525,3 +1525,33 @@ body.locked { overflow: hidden; }
 .code-row.used code { opacity: 0.55; }
 .code-row.revoked code { text-decoration: line-through; opacity: 0.45; }
 @media (max-width: 760px) { .admin-grid { grid-template-columns: 1fr; } }
+
+/* ---------- 历史记录（弹窗 + 状态徽标） ---------- */
+.history-wrap { display: flex; flex-direction: column; gap: 10px; }
+.hist-row {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 12px 14px;
+  cursor: pointer;
+  display: flex; flex-direction: column; gap: 6px;
+  transition: border-color .15s;
+}
+.hist-row:hover { border-color: var(--brand); }
+.hist-main { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.hist-main b { margin-right: 2px; }
+.hist-badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; font-weight: 600; }
+.hist-badge.done { background: rgba(46, 160, 67, 0.12); color: #2e9a43; }
+.hist-badge.running { background: rgba(162, 76, 22, 0.12); color: var(--brand); }
+.hist-preview { font-size: 13px; color: var(--ink-soft); }
+.truncate { display: inline-block; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.hist-actions { text-align: right; }
+.history-modal { max-width: 640px; }
+.hist-summarizing { text-align: center; padding: 20px 6px; }
+.hist-spin {
+  display: inline-block; width: 22px; height: 22px; margin-bottom: 8px;
+  border: 3px solid var(--line); border-top-color: var(--brand); border-radius: 50%;
+  animation: histspin .8s linear infinite;
+}
+@keyframes histspin { to { transform: rotate(360deg); } }
