@@ -893,27 +893,32 @@ function setupMic(textarea, interimEl, micBtn, sendBtn, opts = {}) {
     releaseStream();
     await new Promise((r) => setTimeout(r, 350));
 
-    // 流式可用且已有可观文本 → 直接用（边说边看的结果）；否则回退整段 Whisper 兜底
+    // 停录后：优先用整段 Whisper 精转写（准确优先）；实时字幕只是过渡展示。
+    // 只有 Whisper 失败/没有录音时才回退实时字幕文本。
     let ok = false;
-    if (streamOK && streamFinal.trim().length >= 20) {
-      confirmed = (baseText ? baseText + '\n' : '') + streamFinal.trim();
-      ok = true;
-    } else if (blob && blob.size > 2000) {
+    let whisperOk = false;
+    if (blob && blob.size > 2000) {
       try {
         const r = await api.raw('/api/practice/transcribe', blob);
         if (r.text && r.text.trim()) {
           confirmed = (baseText ? baseText + '\n' : '') + r.text.trim();
           ok = true;
+          whisperOk = true;
         }
       } catch (err) {
         toast('服务器转写没成功，先用已识别的文本：' + err.message);
       }
     }
+    // Whisper 失败时，回退流式字幕（至少有内容）
+    if (!ok && streamOK && streamFinal.trim().length >= 20) {
+      confirmed = (baseText ? baseText + '\n' : '') + streamFinal.trim();
+      ok = true;
+    }
     textarea.value = ok ? confirmed : (confirmed || '');
     if (interimEl) interimEl.textContent = '';
     if (opts.onText) opts.onText(textarea.value);
 
-    // 停录后：对实时字幕做一次"去重 + AI 补标点"（异步、可失败，完成后再覆盖输入框）
+    // 停录后：AI 补标点（异步、可失败）。Whisper 文本走补标点，流式回退文本也走（去重+补点）
     if (ok && confirmed && confirmed.trim().length >= 20) {
       try {
         const fmtR = await api.post('/api/text/format', { text: confirmed });
@@ -923,7 +928,7 @@ function setupMic(textarea, interimEl, micBtn, sendBtn, opts = {}) {
           textarea.value = confirmed;
           if (opts.onText) opts.onText(confirmed);
         }
-      } catch { /* 补标点失败不阻塞，保留去重后的原文 */ }
+      } catch { /* 补标点失败不阻塞，保留原文 */ }
     }
 
     submitting = false;
