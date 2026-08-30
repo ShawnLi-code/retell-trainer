@@ -78,6 +78,70 @@ const app = express();
 app.use(express.json({ limit: '2mb', verify: (req, _res, buf) => { req.rawBody = buf; } }));
 app.use(express.static(path.join(__dirname, 'public')));
 
+// ---------- BOSS直聘岗位监测（自带鉴权，不走下方全站邀请码门） ----------
+// 两种身份：站内登录会话（看数据；站长可改参数/触发抓取）｜ Authorization: Bearer BOSS_TOKEN（本机抓取端拉参数/推送数据）
+// 抓取端跑在你本机 Windows（auto_boss_daily/，依赖已过滑块验证的常驻 Chrome），服务器只存数据不抓 Boss。
+const boss = require('./boss');
+const BOSS_TOKEN = String(process.env.BOSS_TOKEN || '');
+function bossAgent(req) { return Boolean(BOSS_TOKEN) && String(req.headers.authorization || '') === 'Bearer ' + BOSS_TOKEN; }
+function bossGate(req, res) {
+  if (bossAgent(req)) return true;
+  if (auth.readAuth(req)) return true;
+  res.status(401).json({ error: '请先输入邀请码', needAuth: true });
+  return false;
+}
+
+app.get('/api/boss/overview', (req, res) => {
+  if (!bossGate(req, res)) return;
+  const ov = boss.overview();
+  res.json({ ...ov, config: boss.getConfig() });
+});
+
+app.get('/api/boss/day/:date', (req, res) => {
+  if (!bossGate(req, res)) return;
+  const day = boss.getDay(req.params.date);
+  if (!day) return res.status(404).json({ error: '没有这一天的数据' });
+  res.json(day);
+});
+
+app.get('/api/boss/config', (req, res) => {
+  if (!bossGate(req, res)) return;
+  res.json({ config: boss.getConfig() });
+});
+
+app.put('/api/boss/config', (req, res) => {
+  const u = auth.readAuth(req);
+  if (!u || !u.is_owner) return res.status(403).json({ error: '只有站长可以修改抓取参数' });
+  const r = boss.normalizeConfig(req.body || {});
+  if (!r.ok) return res.status(400).json({ error: r.error });
+  res.json({ ok: true, config: boss.saveConfig(r.config, u.name || u.uid) });
+});
+
+// 网页「立即抓取」：立标志 → 本机 5 分钟轮询器消费后启动一次抓取
+app.post('/api/boss/trigger', (req, res) => {
+  const u = auth.readAuth(req);
+  if (!u || !u.is_owner) return res.status(403).json({ error: '只有站长可以触发抓取' });
+  boss.setTrigger(u.name || u.uid);
+  res.json({ ok: true, hint: '已通知本机抓取端，5 分钟内会开始抓取（整轮约 3-8 分钟，抓完这里就有新数据）' });
+});
+
+// 抓取端轮询：返回 { run, config }，同时消费掉「立即抓取」标志
+app.get('/api/boss/poll', (req, res) => {
+  if (!bossAgent(req)) return res.status(BOSS_TOKEN ? 403 : 503).json({ error: BOSS_TOKEN ? 'token 不对' : '服务器未配置 BOSS_TOKEN，无法接收抓取端' });
+  res.json(boss.consumeTrigger());
+});
+
+// 抓取端推送每日数据（summary 结构同本地 boss_daily/YYYY-MM-DD.json）
+app.post('/api/boss/push', (req, res) => {
+  if (!bossAgent(req)) return res.status(BOSS_TOKEN ? 403 : 503).json({ error: BOSS_TOKEN ? 'token 不对' : '服务器未配置 BOSS_TOKEN，无法接收抓取端' });
+  try {
+    boss.saveDaily(req.body || {});
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
 // 追问轮数上限（用户发言次数达到该值后强制收尾）
 const MAX_TURNS = 6;
 

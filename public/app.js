@@ -166,7 +166,7 @@ const session = { id: null, card: null, turns: [], busy: false };
 const RETELL_SECONDS = 90;
 
 // ---------- 路由 ----------
-const NAV_GROUP = { home: 'practice', practice: 'practice', speech: 'speech', cards: 'material', bookshelf: 'reading', interview: 'interview', books: 'library', words: 'words', history: 'history', settings: 'settings', admin: 'admin' };
+const NAV_GROUP = { home: 'practice', practice: 'practice', speech: 'speech', cards: 'material', bookshelf: 'reading', interview: 'interview', boss: 'boss', books: 'library', words: 'words', history: 'history', settings: 'settings', admin: 'admin' };
 function router() {
   const parts = (location.hash.replace(/^#\/?/, '') || 'home').split('/');
   const hash = parts[0];
@@ -180,7 +180,7 @@ function router() {
   app.innerHTML = '';
   app.className = '';
   if (hash === 'cards') { cards(app, parts[1] || 'ted'); return; }
-  const views = { home, practice, speech, bookshelf, interview, books, history, words, settings, admin };
+  const views = { home, practice, speech, bookshelf, interview, boss, books, history, words, settings, admin };
   (views[hash] || home)(app);
 }
 window.addEventListener('hashchange', router);
@@ -2888,6 +2888,246 @@ async function admin(root) {
     if (!confirm('把这位用户踢下线？（他的数据不会被删，只是要重新输入邀请码登录）')) return;
     try { await api.post(`/api/admin/users/${b.dataset.uid}/revoke`, {}); toast('已踢下线'); admin(root); } catch (err) { toast(err.message); }
   }));
+}
+
+// ---------- 岗位监测（BOSS直聘 · 每日快照） ----------
+// 数据来源：本机 Windows 抓取端（auto_boss_daily）每天 09:00 抓取并推送到服务器，这里只读展示。
+// 「像 Boss 那样设置参数」：站长在下方面板改参数（或直接粘贴 Boss 筛选网址解析），下次抓取自动生效。
+const BOSS_STATE = { date: '', city: '全部', q: '', sort: 'default', onlyNew: false, onlyOnline: false };
+
+// Boss 城市码预设（网页 /web/geek/jobs URL 里的 city 参数）
+const BOSS_CITY_PRESETS = [
+  { name: '西安', code: '101110100' }, { name: '广州', code: '101280100' }, { name: '成都', code: '101270100' },
+  { name: '北京', code: '101010100' }, { name: '上海', code: '101020100' }, { name: '深圳', code: '101280600' },
+  { name: '杭州', code: '101210100' }, { name: '武汉', code: '101200100' },
+];
+const BOSS_EXP_OPTIONS = [['', '不限'], ['101', '在校生'], ['102', '应届毕业生'], ['103', '1年以内'], ['104', '1-3年'], ['105', '3-5年'], ['106', '5-10年'], ['107', '10年以上']];
+
+function bossSalaryNum(s) {
+  const m = String(s || '').match(/(\d+)\s*-\s*(\d+)\s*K/i);
+  if (m) return Math.max(Number(m[1]), Number(m[2]));
+  return 0;
+}
+function bossJobUrl(id) { return 'https://www.zhipin.com/job_detail/' + encodeURIComponent(id) + '.html'; }
+// 解析用户粘贴的 Boss 筛选网址 → 填充参数表单
+function bossParseUrl(url) {
+  try {
+    const u = new URL(url);
+    if (!/zhipin\.com$/i.test(u.hostname.replace(/^www\./i, ''))) return null;
+    const get = (k) => (u.searchParams.get(k) || '').trim();
+    const out = { query: get('query'), experience: get('experience').replace(/\D/g, ''), salary: get('salary').replace(/\D/g, '') };
+    const cityCode = get('city').replace(/\D/g, '');
+    if (cityCode) {
+      const preset = BOSS_CITY_PRESETS.find((c) => c.code === cityCode);
+      out.cities = [{ name: preset ? preset.name : '城市' + cityCode, code: cityCode }];
+    }
+    return out.query || out.cities || out.experience || out.salary ? out : null;
+  } catch { return null; }
+}
+
+async function boss(root) {
+  refreshBadge();
+  root.innerHTML = '<h2>岗位监测</h2><p class="dim">加载中…</p>';
+  let ov;
+  try { ov = await api.get('/api/boss/overview'); } catch (e) {
+    root.innerHTML = `<h2>岗位监测</h2><p class="dim">${esc(e.message)}</p>`;
+    return;
+  }
+  const cfg = ov.config || {};
+  const cities = (cfg.cities || []);
+  if (!BOSS_STATE.date || !ov.dates.some((d) => d.date === BOSS_STATE.date)) BOSS_STATE.date = ov.latest || '';
+
+  // 选中日期的快照
+  let day = null;
+  if (BOSS_STATE.date) day = await api.get('/api/boss/day/' + BOSS_STATE.date).catch(() => null);
+  const dayCities = (day && day.cities) || [];
+  const week = (day && day.weekActiveByCity) || {};
+  const firstSeen = (ov.index && ov.index.firstSeen) || {};
+  const activeSet = new Set((ov.index && ov.index.activeIds) || []);
+  const isNew = (id) => Boolean(id && firstSeen[id] === BOSS_STATE.date);
+
+  // 组装当前筛选下的岗位列表
+  let jobs = [];
+  for (const c of dayCities) {
+    if (BOSS_STATE.city !== '全部' && c.city !== BOSS_STATE.city) continue;
+    for (const j of (c.jobs || [])) {
+      jobs.push({ ...j, city: c.city });
+    }
+  }
+  const q = BOSS_STATE.q.trim().toLowerCase();
+  if (q) jobs = jobs.filter((j) => String(j.name || '').toLowerCase().includes(q) || String(j.company || '').toLowerCase().includes(q));
+  if (BOSS_STATE.onlyNew) jobs = jobs.filter((j) => isNew(j.id));
+  if (BOSS_STATE.onlyOnline) jobs = jobs.filter((j) => j.online);
+  if (BOSS_STATE.sort === 'salary') jobs.sort((a, b) => bossSalaryNum(b.salary) - bossSalaryNum(a.salary));
+  else if (BOSS_STATE.sort === 'active') jobs.sort((a, b) => (activeSet.has(b.id) ? 1 : 0) - (activeSet.has(a.id) ? 1 : 0) || bossSalaryNum(b.salary) - bossSalaryNum(a.salary));
+  else if (BOSS_STATE.sort === 'new') jobs.sort((a, b) => (isNew(b.id) ? 1 : 0) - (isNew(a.id) ? 1 : 0));
+
+  const st = ov.status || {};
+  const needVerify = Boolean(st.needVerify) || Boolean(day && day.needVerify);
+  const pushAt = st.lastPushAt ? String(st.lastPushAt).slice(0, 16).replace('T', ' ') : '还没有推送记录';
+
+  // 城市统计卡
+  const cityCard = (c) => {
+    const list = (c.jobs || []);
+    const newN = list.filter((j) => isNew(j.id)).length;
+    const wk = (week[c.city] || {}).weekActive ?? '—';
+    return `
+      <button class="boss-city-card ${BOSS_STATE.city === c.city ? 'active' : ''}" data-city="${esc(c.city)}">
+        <b>${esc(c.city)}</b>
+        <span>${list.length} 个在招</span>
+        <span class="dim">🆕 ${newN} · 本周活跃 ${wk} · 在线 ${c.bossOnline ?? '—'}</span>
+        ${c.risk ? '<em class="boss-risk">⚠️ 需要过滑块</em>' : ''}
+      </button>`;
+  };
+
+  // 岗位行
+  const jobRow = (j) => `
+    <a class="boss-job" href="${bossJobUrl(j.id)}" target="_blank" rel="noreferrer">
+      <div class="bj-main">
+        <div class="bj-top">
+          <b class="bj-name">${esc(j.name || '未命名岗位')}</b>
+          ${isNew(j.id) ? '<span class="bj-badge new">新</span>' : ''}
+          ${activeSet.has(j.id) ? '<span class="bj-badge active">本周活跃</span>' : ''}
+          ${j.online ? '<span class="bj-badge online">● BOSS在线</span>' : ''}
+        </div>
+        <div class="bj-meta">${esc(j.company || '')}<i>·</i>${esc(j.city)}${j.district ? ' ' + esc(j.district) : ''}<i>·</i>${esc(j.exp || '')}${j.degree ? ' ' + esc(j.degree) : ''}</div>
+        ${(j.labels && j.labels.length) || (j.skills && j.skills.length) ? `<div class="bj-tags">${[].concat(j.labels || [], j.skills || []).slice(0, 6).map((t) => `<span>${esc(t)}</span>`).join('')}</div>` : ''}
+      </div>
+      <div class="bj-salary">${esc(j.salary || '面议')}</div>
+    </a>`;
+
+  // 趋势（近 14 天）
+  const trend = ov.dates.slice(-14);
+  const trendMax = Math.max(1, ...trend.map((d) => d.total));
+  const trendHtml = trend.length ? `
+    <section class="boss-panel">
+      <h3>近 ${trend.length} 天岗位数</h3>
+      <div class="boss-trend">
+        ${trend.map((d) => `<div class="bt-col" title="${d.date} · ${d.total} 个岗位${d.needVerify ? '（⚠️需过滑块）' : ''}">
+          <span class="bt-n">${d.total}</span>
+          <i style="height:${Math.max(6, Math.round(d.total / trendMax * 72))}px" class="${d.date === BOSS_STATE.date ? 'today' : ''}"></i>
+          <em>${d.date.slice(5)}</em>
+        </div>`).join('')}
+      </div>
+    </section>` : '';
+
+  // 站长参数面板
+  const cfgCities = [...cities];
+  for (const p of BOSS_CITY_PRESETS) if (!cfgCities.some((c) => c.code === p.code)) cfgCities.push({ ...p, _off: true });
+  const cfgHtml = !ME.isOwner ? '' : `
+    <section class="boss-panel boss-config">
+      <h3>抓取参数 <span class="count">保存后，下次抓取自动生效（每天 09:00 或点「立即抓取」）</span></h3>
+      <div class="boss-cfg-grid">
+        <label>关键词<input id="bc-query" value="${esc(cfg.query || '')}" placeholder="如：测试 / 软件测试" maxlength="40" /></label>
+        <label>经验<select id="bc-exp">${BOSS_EXP_OPTIONS.map(([v, n]) => `<option value="${v}" ${cfg.experience === v ? 'selected' : ''}>${n}${v === '104' ? '（现用）' : ''}</option>`).join('')}</select></label>
+        <label>薪资档<select id="bc-sal">
+          <option value="" ${!cfg.salary ? 'selected' : ''}>不限</option>
+          <option value="404" ${cfg.salary === '404' ? 'selected' : ''}>8-13K档（现用）</option>
+          <option value="402" ${cfg.salary === '402' ? 'selected' : ''}>其他档位→先用解析网址</option>
+        </select></label>
+        <label>每城页数<select id="bc-pages">${[1, 2, 3].map((n) => `<option value="${n}" ${Number(cfg.pages) === n ? 'selected' : ''}>${n} 页（约 ${n * 30} 个/城）</option>`).join('')}</select></label>
+      </div>
+      <div class="boss-cfg-cities">${cfgCities.map((c) => `
+        <label class="bc-city ${c._off ? '' : 'on'}"><input type="checkbox" data-code="${esc(c.code)}" data-name="${esc(c.name)}" ${c._off ? '' : 'checked'} />${esc(c.name)}</label>`).join('')}
+      </div>
+      <p class="dim">薪资/城市的更多档位：先在 <a href="https://www.zhipin.com/web/geek/jobs/" target="_blank" rel="noreferrer">Boss 网页</a>上筛好，把地址栏网址粘贴到下面解析，参数会自动填进来。</p>
+      <div class="gen-row">
+        <input id="bc-url" placeholder="粘贴 Boss 筛选后的完整网址 https://www.zhipin.com/web/geek/jobs?query=..." />
+        <button id="bc-parse" class="ghost small">解析网址</button>
+      </div>
+      <div class="gen-row">
+        <button id="bc-save" class="primary">${iconBtn(ICONS.sparkles, '保存参数')}</button>
+        <button id="bc-trigger" class="ghost">${iconBtn(ICONS.refresh, '立即抓取')}</button>
+        <span id="bc-msg" class="dim"></span>
+      </div>
+    </section>`;
+
+  root.innerHTML = `
+    <h2>岗位监测 <span class="dim boss-sub">BOSS直聘 · ${esc(cfg.query || '测试')}</span></h2>
+    <p class="dim">每天 09:00 自动抓取三城岗位快照并推送到这里，看看符合条件的机会每天在怎么刷新。点岗位卡可直达 Boss 详情页。</p>
+    <div class="boss-statusbar">
+      <span>数据日期 <select id="boss-date">${ov.dates.slice(-30).reverse().map((d) => `<option value="${d.date}" ${d.date === BOSS_STATE.date ? 'selected' : ''}>${d.date}</option>`).join('') || '<option>暂无数据</option>'}</select></span>
+      <span>最近推送 ${esc(pushAt)}</span>
+      ${needVerify ? '<span class="boss-risk">⚠️ 最近一次撞到滑块验证，数据可能不全——去本机 Chrome 窗口拖一下滑块</span>' : '<span class="dim">抓取端状态正常</span>'}
+      ${ME.isOwner ? `<button id="boss-trigger-top" class="ghost small">${iconBtn(ICONS.refresh, '立即抓取')}</button>` : ''}
+    </div>
+    <div class="boss-city-grid">${dayCities.map(cityCard).join('') || '<p class="dim">这一天没有数据。</p>'}</div>
+    <div class="boss-filters">
+      <div class="boss-tabs">
+        <button data-city="全部" class="${BOSS_STATE.city === '全部' ? 'active' : ''}">全部</button>
+        ${dayCities.map((c) => `<button data-city="${esc(c.city)}" class="${BOSS_STATE.city === c.city ? 'active' : ''}">${esc(c.city)}</button>`).join('')}
+      </div>
+      <input id="boss-q" placeholder="搜岗位名 / 公司" value="${esc(BOSS_STATE.q)}" />
+      <select id="boss-sort">
+        <option value="default" ${BOSS_STATE.sort === 'default' ? 'selected' : ''}>Boss 默认排序</option>
+        <option value="salary" ${BOSS_STATE.sort === 'salary' ? 'selected' : ''}>薪资从高到低</option>
+        <option value="new" ${BOSS_STATE.sort === 'new' ? 'selected' : ''}>新岗位优先</option>
+        <option value="active" ${BOSS_STATE.sort === 'active' ? 'selected' : ''}>本周活跃优先</option>
+      </select>
+      <label class="boss-check"><input type="checkbox" id="boss-only-new" ${BOSS_STATE.onlyNew ? 'checked' : ''}/>只看🆕</label>
+      <label class="boss-check"><input type="checkbox" id="boss-only-online" ${BOSS_STATE.onlyOnline ? 'checked' : ''}/>只看在线</label>
+    </div>
+    <div class="boss-jobs">${jobs.map(jobRow).join('') || '<p class="dim">没有符合条件的岗位。</p>'}</div>
+    <p class="dim boss-count">共 ${jobs.length} 个岗位 · 「本周活跃」= 最近 7 天快照里 BOSS 出现过在线的岗位（网页端拿不到 App 的"本周活跃"标签，这是最接近的构造）</p>
+    ${trendHtml}
+    ${cfgHtml}`;
+
+  // —— 交互 ——
+  const rerender = () => boss(root);
+  $('#boss-date')?.addEventListener('change', (e) => { BOSS_STATE.date = e.target.value; rerender(); });
+  root.querySelectorAll('.boss-tabs button, .boss-city-card').forEach((b) => b.addEventListener('click', () => { BOSS_STATE.city = b.dataset.city; rerender(); }));
+  let qTimer = null;
+  $('#boss-q')?.addEventListener('input', (e) => {
+    clearTimeout(qTimer);
+    qTimer = setTimeout(() => { BOSS_STATE.q = e.target.value; rerender(); $('#boss-q')?.focus(); }, 350);
+  });
+  $('#boss-sort')?.addEventListener('change', (e) => { BOSS_STATE.sort = e.target.value; rerender(); });
+  $('#boss-only-new')?.addEventListener('change', (e) => { BOSS_STATE.onlyNew = e.target.checked; rerender(); });
+  $('#boss-only-online')?.addEventListener('change', (e) => { BOSS_STATE.onlyOnline = e.target.checked; rerender(); });
+
+  const triggerScrape = async (msgEl) => {
+    try {
+      const r = await api.post('/api/boss/trigger', {});
+      if (msgEl) msgEl.textContent = r.hint || '已通知抓取端';
+      toast(r.hint || '已通知本机抓取端，几分钟内出数据');
+    } catch (e) { if (msgEl) msgEl.textContent = e.message; else toast(e.message); }
+  };
+  $('#boss-trigger-top')?.addEventListener('click', () => triggerScrape());
+
+  if (ME.isOwner) {
+    $('#bc-save')?.addEventListener('click', async () => {
+      const msg = $('#bc-msg');
+      const citiesSel = [...root.querySelectorAll('.bc-city input:checked')].map((i) => ({ name: i.dataset.name, code: i.dataset.code }));
+      const body = {
+        query: $('#bc-query').value.trim(),
+        cities: citiesSel,
+        experience: $('#bc-exp').value,
+        salary: $('#bc-sal').value,
+        pages: Number($('#bc-pages').value) || 1,
+      };
+      try {
+        const r = await fetch('/api/boss/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.error || '保存失败');
+        if (msg) msg.textContent = '已保存 ✅ 下次抓取生效';
+        toast('抓取参数已保存，下次抓取自动生效');
+      } catch (e) { if (msg) msg.textContent = e.message; else toast(e.message); }
+    });
+    $('#bc-parse')?.addEventListener('click', () => {
+      const msg = $('#bc-msg');
+      const parsed = bossParseUrl($('#bc-url').value.trim());
+      if (!parsed) { if (msg) msg.textContent = '没解析出参数——确认是 zhipin.com 的 jobs 网址'; return; }
+      if (parsed.query) $('#bc-query').value = parsed.query;
+      if (parsed.experience) $('#bc-exp').value = parsed.experience;
+      if (parsed.salary) $('#bc-sal').value = parsed.salary;
+      if (parsed.cities) {
+        const code = parsed.cities[0].code;
+        root.querySelectorAll('.bc-city input').forEach((i) => { i.checked = i.dataset.code === code; });
+      }
+      if (msg) msg.textContent = '已填入，检查无误后点「保存参数」';
+    });
+    $('#bc-trigger')?.addEventListener('click', () => triggerScrape($('#bc-msg')));
+  }
 }
 
 // ---------- 启动 ----------

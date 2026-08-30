@@ -1588,3 +1588,62 @@ body.locked { overflow: hidden; }
 .word-kind { margin-left: auto; font-size: 11px; padding: 2px 8px; border-radius: 999px; background: rgba(162,76,22,0.1); color: var(--brand); }
 .word-reason { margin-top: 8px; font-size: 13px; color: var(--ink-soft); line-height: 1.6; }
 .word-reason b { color: var(--ink); }
+
+/* ---------- 岗位监测（BOSS直聘每日快照） ---------- */
+.boss-sub { font-family: var(--font-body); font-size: 14px; font-weight: 400; color: var(--ink-dim); }
+.boss-statusbar { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); padding: 10px 14px; margin-bottom: 14px; font-size: 13px; color: var(--ink-soft); }
+.boss-statusbar select { padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; background: #fff; font-size: 13px; }
+.boss-risk { color: #a24c16; background: var(--brand-soft); border-radius: 6px; padding: 2px 8px; font-style: normal; font-size: 12px; }
+
+.boss-city-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.boss-city-card { text-align: left; background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); padding: 12px 14px; cursor: pointer; display: flex; flex-direction: column; gap: 3px; font-family: var(--font-body); }
+.boss-city-card:hover { border-color: var(--brand); }
+.boss-city-card.active { border-color: var(--brand); background: var(--brand-soft); }
+.boss-city-card b { font-size: 15px; color: var(--ink); }
+.boss-city-card > span:first-of-type { font-size: 20px; font-weight: 700; color: var(--brand); }
+.boss-city-card .dim { font-size: 12px; color: var(--ink-dim); }
+
+.boss-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 4px 0 12px; }
+.boss-tabs { display: flex; gap: 6px; }
+.boss-tabs button { padding: 5px 14px; border: 1px solid var(--line); border-radius: 999px; background: var(--card); font-size: 13px; cursor: pointer; color: var(--ink-soft); }
+.boss-tabs button.active { background: var(--brand); border-color: var(--brand); color: #fffdf9; }
+.boss-filters input#boss-q { flex: 1 1 150px; max-width: 220px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; font-size: 13px; background: #fff; }
+.boss-filters select { padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: #fff; font-size: 13px; }
+.boss-check { font-size: 13px; color: var(--ink-soft); display: flex; align-items: center; gap: 4px; cursor: pointer; }
+
+.boss-jobs { display: flex; flex-direction: column; gap: 8px; }
+.boss-job { display: flex; justify-content: space-between; align-items: center; gap: 14px; background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); padding: 12px 16px; text-decoration: none; color: var(--ink); transition: border-color .15s; }
+.boss-job:hover { border-color: var(--brand); }
+.bj-main { min-width: 0; }
+.bj-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.bj-name { font-size: 15px; font-weight: 600; }
+.bj-meta { font-size: 12.5px; color: var(--ink-soft); margin-top: 3px; }
+.bj-meta i { font-style: normal; margin: 0 6px; color: var(--ink-dim); }
+.bj-tags { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px; }
+.bj-tags span { font-size: 11.5px; color: var(--ink-soft); background: #f2ede3; border-radius: 4px; padding: 1.5px 7px; }
+.bj-salary { font-size: 16px; font-weight: 700; color: var(--brand); white-space: nowrap; font-family: var(--font-title); }
+.bj-badge { font-size: 11px; border-radius: 4px; padding: 1px 6px; font-style: normal; white-space: nowrap; }
+.bj-badge.new { color: #fffdf9; background: var(--brand); }
+.bj-badge.active { color: var(--green); background: var(--green-soft); }
+.bj-badge.online { color: var(--green); }
+.boss-count { margin: 10px 2px 0; font-size: 12px; }
+
+.boss-panel { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); padding: 16px 18px; margin-top: 16px; }
+.boss-panel h3 { margin: 0 0 10px; font-size: 15px; }
+.boss-trend { display: flex; align-items: flex-end; gap: 8px; height: 110px; padding-top: 6px; }
+.bt-col { display: flex; flex-direction: column; align-items: center; gap: 3px; flex: 1; min-width: 0; }
+.bt-col .bt-n { font-size: 11px; color: var(--ink-dim); }
+.bt-col i { width: 70%; max-width: 34px; background: var(--brand-soft); border-radius: 3px 3px 0 0; }
+.bt-col i.today { background: var(--brand); }
+.bt-col em { font-style: normal; font-size: 10.5px; color: var(--ink-dim); white-space: nowrap; }
+
+.boss-config .boss-cfg-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px 14px; margin-bottom: 10px; }
+.boss-config label { font-size: 13px; color: var(--ink-soft); display: flex; flex-direction: column; gap: 4px; }
+.boss-config input, .boss-config select { padding: 7px 10px; border: 1px solid var(--line); border-radius: 6px; font-size: 13px; background: #fff; }
+.boss-cfg-cities { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 10px; }
+.bc-city { flex-direction: row !important; align-items: center; gap: 5px !important; border: 1px solid var(--line); border-radius: 999px; padding: 4px 12px; cursor: pointer; font-size: 13px; color: var(--ink-soft); }
+.bc-city.on { border-color: var(--brand); color: var(--brand); background: var(--brand-soft); }
+.boss-config .gen-row { margin: 8px 0 2px; }
+.boss-config .gen-row input { flex: 1; }
+#bc-msg { font-size: 12.5px; }
+@media (max-width: 760px) { .boss-job { flex-direction: column; align-items: flex-start; gap: 6px; } }
